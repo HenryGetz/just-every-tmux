@@ -446,12 +446,12 @@ fn format_update_plan_call(args: &Value) -> String {
             let step = item.get("step").and_then(Value::as_str).unwrap_or("(unnamed step)");
             let mut suffix = String::new();
             if status == "in_progress" {
-                suffix.push_str(" _(in progress)_");
+                suffix.push_str(" (in progress)");
             } else if status != "completed" && status != "pending" {
-                suffix.push_str(&format!(" _(status: {})_", status));
+                suffix.push_str(&format!(" (status: {})", status));
             }
 
-            let mark = if status == "completed" { "x" } else { " " };
+            let mark = if status == "completed" { "X" } else { " " };
             lines.push(format!("- [{}] {}{}", mark, step, suffix));
         }
     }
@@ -1227,7 +1227,7 @@ mod tests {
 
         let summary = summarize_tool_call("update_plan", &args, 40);
         assert!(summary.contains("- plan: Version Recon + Docs"));
-        assert!(summary.contains("- [ ] Run torsocks-only version probes _(in progress)_"));
+        assert!(summary.contains("- [ ] Run torsocks-only version probes (in progress)"));
         assert!(summary.contains("torsocks-only version probes"));
         assert!(!summary.contains("..."));
     }
