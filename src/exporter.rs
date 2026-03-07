@@ -1,0 +1,1053 @@
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportMode {
+    Compact,
+    Medium,
+    Full,
+}
+
+#[derive(Clone, Debug)]
+struct MediumToolCall {
+    name: String,
+    summary: String,
+}
+
+impl ExportMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExportMode::Compact => "compact",
+            ExportMode::Medium => "medium",
+            ExportMode::Full => "full",
+        }
+    }
+}
+
+pub fn export_session_markdown(
+    session_id: &str,
+    out_path: &Path,
+    mode: ExportMode,
+    code_dir: &Path,
+) -> Result<PathBuf, String> {
+    let rollout = rollout_path_for_session(session_id, code_dir)?;
+    if !rollout.exists() {
+        return Err(format!("Rollout file not found: {}", rollout.display()));
+    }
+
+    let out_file = resolve_output_path(session_id, out_path)?;
+    let session_meta = first_session_meta(&rollout)?;
+
+    let mut out = BufWriter::new(
+        File::create(&out_file).map_err(|e| format!("failed to create {}: {}", out_file.display(), e))?,
+    );
+
+    writeln!(out, "# Chat Transcript\n").map_err(|e| e.to_string())?;
+    writeln!(out, "Session ID: {}\n", session_id).map_err(|e| e.to_string())?;
+    writeln!(out, "Export Mode: {}", mode.as_str()).map_err(|e| e.to_string())?;
+    writeln!(out, "Exported At (UTC): {}\n", Utc::now().to_rfc3339()).map_err(|e| e.to_string())?;
+    if let Some(meta) = session_meta {
+        writeln!(out, "Session Meta:").map_err(|e| e.to_string())?;
+        for key in ["timestamp", "cwd", "originator", "cli_version"] {
+            if let Some(val) = meta.get(key) {
+                writeln!(out, "- {}: {}", key, value_as_string(val)).map_err(|e| e.to_string())?;
+            }
+        }
+        writeln!(out).map_err(|e| e.to_string())?;
+    }
+    writeln!(out, "---\n").map_err(|e| e.to_string())?;
+
+    let file = File::open(&rollout).map_err(|e| format!("failed to open {}: {}", rollout.display(), e))?;
+    let reader = BufReader::new(file);
+    let mut image_idx = 0usize;
+    let mut last_written_block: Option<String> = None;
+    let mut pending_medium_calls: HashMap<String, MediumToolCall> = HashMap::new();
+    let mut medium_output_sigs: HashMap<String, String> = HashMap::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let obj: Value = serde_json::from_str(&line).map_err(|e| format!("invalid jsonl in {}: {}", rollout.display(), e))?;
+        let ts = obj.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let otype = obj.get("type").and_then(Value::as_str).unwrap_or("");
+
+        match mode {
+            ExportMode::Compact => {
+                if otype != "response_item" {
+                    continue;
+                }
+                if let Some(rendered) = render_compact_response_item(ts, obj.get("payload"), &mut image_idx) {
+                    if last_written_block.as_deref() == Some(rendered.as_str()) {
+                        continue;
+                    }
+                    out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                    last_written_block = Some(rendered);
+                }
+            }
+            ExportMode::Medium => {
+                if otype == "response_item" {
+                    let payload = obj.get("payload");
+                    let ptype = payload
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+
+                    if ptype == "function_call" {
+                        if let Some((call_id, call)) = capture_medium_tool_call(payload, 140) {
+                            pending_medium_calls.insert(call_id, call);
+                        }
+                        continue;
+                    }
+
+                    if ptype == "function_call_output" {
+                        let call_id = payload
+                            .and_then(|p| p.get("call_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let paired_call = pending_medium_calls.get(&call_id);
+                        if !call_id.is_empty() {
+                            let sig = medium_tool_output_signature(payload);
+                            if medium_output_sigs.get(&call_id).is_some_and(|prev| prev == &sig) {
+                                continue;
+                            }
+                            medium_output_sigs.insert(call_id.clone(), sig);
+                        }
+                        if let Some(rendered) =
+                            render_medium_tool_output(ts, payload, paired_call, 180)
+                        {
+                            if last_written_block.as_deref() == Some(rendered.as_str()) {
+                                continue;
+                            }
+                            out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                            last_written_block = Some(rendered);
+                        }
+                        continue;
+                    }
+
+                    if let Some(rendered) = render_medium_response_item(ts, payload, &mut image_idx, 180) {
+                        if last_written_block.as_deref() == Some(rendered.as_str()) {
+                            continue;
+                        }
+                        out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                        last_written_block = Some(rendered);
+                    }
+                } else if otype == "event" {
+                    let payload = obj.get("payload").cloned().unwrap_or(Value::Null);
+                    let label = event_label(&payload);
+                    if !is_medium_event_worthy(&label) {
+                        continue;
+                    }
+                    let rendered = {
+                        let title = if label.is_empty() {
+                            "EVENT".to_string()
+                        } else {
+                            format!("EVENT `{}`", inline_code(&label))
+                        };
+                        let body = if payload.is_null() {
+                            "(no details)".to_string()
+                        } else {
+                            format!("- details: {}", format_medium_event(&payload, 240))
+                        };
+                        markdown_section(ts, &title, &body)
+                    };
+                    if last_written_block.as_deref() == Some(rendered.as_str()) {
+                        continue;
+                    }
+                    out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                    last_written_block = Some(rendered);
+                }
+            }
+            ExportMode::Full => {
+                if let Some(rendered) = render_full_item(ts, otype, obj.get("payload"), &mut image_idx) {
+                    if last_written_block.as_deref() == Some(rendered.as_str()) {
+                        continue;
+                    }
+                    out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                    last_written_block = Some(rendered);
+                }
+            }
+        }
+    }
+
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(out_file)
+}
+
+fn resolve_output_path(session_id: &str, out_path: &Path) -> Result<PathBuf, String> {
+    if out_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
+        return Ok(out_path.to_path_buf());
+    }
+
+    fs::create_dir_all(out_path)
+        .map_err(|e| format!("failed to create {}: {}", out_path.display(), e))?;
+    Ok(out_path.join(format!("{}.md", session_id)))
+}
+
+fn rollout_path_for_session(session_id: &str, code_dir: &Path) -> Result<PathBuf, String> {
+    let catalog = code_dir.join("sessions/index/catalog.jsonl");
+    let file = File::open(&catalog).map_err(|e| format!("Catalog not found: {} ({})", catalog.display(), e))?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => continue,
+        };
+        let obj: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let sid = obj.get("session_id").and_then(Value::as_str).unwrap_or("");
+        if sid != session_id {
+            continue;
+        }
+        let deleted = obj.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+        if deleted {
+            return Err(format!("Session {} is marked deleted in catalog", session_id));
+        }
+        let rel = obj
+            .get("rollout_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Session {} missing rollout_path in catalog", session_id))?;
+        return Ok(code_dir.join(rel));
+    }
+
+    Err(format!("Session not found in catalog: {}", session_id))
+}
+
+fn first_session_meta(rollout: &Path) -> Result<Option<Value>, String> {
+    let file = File::open(rollout).map_err(|e| format!("failed to open {}: {}", rollout.display(), e))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let obj: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if obj.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return Ok(obj.get("payload").cloned());
+        }
+    }
+    Ok(None)
+}
+
+fn markdown_section(ts: &str, title: &str, body: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("### [{}] {}\n\n", ts, title));
+    out.push_str(body.trim_end());
+    out.push_str("\n\n");
+    out
+}
+
+fn markdown_fence(lang: &str, body: &str) -> String {
+    let safe = body.replace("```", "``\\`");
+    format!("```{}\n{}\n```\n", lang, safe.trim_end())
+}
+
+fn markdown_blockquote(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|line| format!("> {}", line)).collect();
+    lines.join("\n")
+}
+
+fn inline_code(text: &str) -> String {
+    text.replace('`', "'")
+}
+
+fn render_compact_response_item(ts: &str, payload: Option<&Value>, image_idx: &mut usize) -> Option<String> {
+    let payload = payload?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+
+    let role_raw = payload.get("role").and_then(Value::as_str).unwrap_or("unknown");
+    if role_raw != "user" && role_raw != "assistant" {
+        return None;
+    }
+
+    let role = role_raw.to_uppercase();
+    let parts = message_parts(payload.get("content"), image_idx, true);
+    if parts.is_empty() {
+        return None;
+    }
+    if role_raw == "user" && is_auto_system_status_message(&parts) {
+        return None;
+    }
+
+    Some(markdown_section(ts, &role, &parts.join("\n")))
+}
+
+fn render_medium_response_item(
+    ts: &str,
+    payload: Option<&Value>,
+    image_idx: &mut usize,
+    max_len: usize,
+) -> Option<String> {
+    let payload = payload?;
+    let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("unknown");
+
+    match ptype {
+        "message" => render_compact_response_item(ts, Some(payload), image_idx),
+        "function_call" => {
+            let name = payload.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let args = parse_json_maybe(payload.get("arguments"));
+            Some(markdown_section(
+                ts,
+                &format!("TOOL_CALL `{}`", inline_code(name)),
+                &format!("- arguments: {}", one_line_value(&args, max_len, 0)),
+            ))
+        }
+        "function_call_output" => {
+            let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+            let output = parse_json_maybe(payload.get("output"));
+            let output_summary = summarize_tool_output(&output, max_len);
+            Some(markdown_section(
+                ts,
+                &format!("TOOL_OUTPUT `{}`", inline_code(call_id)),
+                &output_summary,
+            ))
+        }
+        "reasoning" => {
+            let summaries = extract_reasoning_summaries(payload);
+            let body = if summaries.is_empty() {
+                "(no reasoning summary)".to_string()
+            } else {
+                summaries
+                    .iter()
+                    .map(|s| markdown_blockquote(s))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            Some(markdown_section(ts, "REASONING", &body))
+        }
+        _ => Some(markdown_section(
+            ts,
+            &format!("RESPONSE_ITEM {}", ptype),
+            &format!("- payload: {}", one_line_value(payload, max_len, 0)),
+        )),
+    }
+}
+
+fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(String, MediumToolCall)> {
+    let payload = payload?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let call_id = payload.get("call_id").and_then(Value::as_str)?.to_string();
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let args = parse_json_maybe(payload.get("arguments"));
+    let summary = summarize_tool_call(&name, &args, max_len);
+
+    Some((call_id, MediumToolCall { name, summary }))
+}
+
+fn summarize_tool_call(name: &str, args: &Value, max_len: usize) -> String {
+    if name == "shell" {
+        let command = args
+            .get("command")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let command_text = if command.len() >= 3
+            && (command[0] == "bash" || command[0] == "sh")
+            && command[1] == "-lc"
+        {
+            command[2].clone()
+        } else {
+            command.join(" ")
+        };
+        let collapsed = collapse_ws(&command_text);
+        if collapsed.contains("apply_patch") {
+            return "apply_patch <patch>".to_string();
+        }
+        return shorten(&collapsed, max_len);
+    }
+
+    let compact_args = collapse_ws(&one_line_value(args, max_len, 0));
+    shorten(&format!("{} {}", name, compact_args), max_len)
+}
+
+fn render_medium_tool_output(
+    ts: &str,
+    payload: Option<&Value>,
+    call: Option<&MediumToolCall>,
+    max_len: usize,
+) -> Option<String> {
+    let payload = payload?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call_output") {
+        return None;
+    }
+
+    let output = parse_json_maybe(payload.get("output"));
+    let output_obj = output.as_object();
+    let mut lines = Vec::new();
+
+    if let Some(call) = call {
+        lines.push(format!("- call: {}", call.summary));
+    }
+
+    let mut exit_code: Option<i64> = None;
+    if let Some(meta) = output_obj
+        .and_then(|obj| obj.get("metadata"))
+        .and_then(Value::as_object)
+    {
+        exit_code = meta.get("exit_code").and_then(Value::as_i64);
+        if let Some(code) = exit_code {
+            lines.push(format!("- exit_code: {}", code));
+        }
+        if let Some(dur) = meta.get("duration_seconds") {
+            lines.push(format!("- duration_s: {}", one_line_value(dur, 40, 0)));
+        }
+    }
+
+    let output_text = output_obj
+        .and_then(|obj| obj.get("output"))
+        .map(|v| one_line_value(v, max_len, 0))
+        .unwrap_or_else(|| one_line_value(&output, max_len, 0));
+
+    if should_include_medium_output(exit_code, &output_text) {
+        lines.push(format!("- output: {}", output_text));
+    }
+
+    if lines.is_empty() {
+        lines.push("- output: (no data)".to_string());
+    }
+
+    let title = call
+        .map(|c| format!("TOOL `{}`", inline_code(&c.name)))
+        .unwrap_or_else(|| "TOOL".to_string());
+    Some(markdown_section(ts, &title, &lines.join("\n")))
+}
+
+fn should_include_medium_output(exit_code: Option<i64>, output: &str) -> bool {
+    if exit_code.unwrap_or(0) != 0 {
+        return true;
+    }
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("fail") || lower.contains("panic") || lower.contains("warn") {
+        return true;
+    }
+    false
+}
+
+fn medium_tool_output_signature(payload: Option<&Value>) -> String {
+    let payload = payload.unwrap_or(&Value::Null);
+    let output = parse_json_maybe(payload.get("output"));
+    let output_obj = output.as_object();
+
+    let code = output_obj
+        .and_then(|obj| obj.get("metadata"))
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("exit_code"))
+        .map(|v| one_line_value(v, 20, 0))
+        .unwrap_or_else(|| "none".to_string());
+    let duration = output_obj
+        .and_then(|obj| obj.get("metadata"))
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("duration_seconds"))
+        .map(|v| one_line_value(v, 20, 0))
+        .unwrap_or_else(|| "none".to_string());
+    let body = output_obj
+        .and_then(|obj| obj.get("output"))
+        .map(|v| one_line_value(v, 200, 0))
+        .unwrap_or_else(|| one_line_value(&output, 200, 0));
+
+    format!("{}|{}|{}", code, duration, body)
+}
+
+fn render_full_item(ts: &str, otype: &str, payload: Option<&Value>, image_idx: &mut usize) -> Option<String> {
+    match otype {
+        "session_meta" => Some(markdown_section(
+            ts,
+            "SESSION_META",
+            &markdown_fence("json", &safe_json(payload.unwrap_or(&Value::Null))),
+        )),
+        "event" => Some(markdown_section(
+            ts,
+            "EVENT",
+            &markdown_fence("json", &safe_json(payload.unwrap_or(&Value::Null))),
+        )),
+        "response_item" => {
+            let payload = payload?;
+            let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("unknown");
+            match ptype {
+                "message" => {
+                    let role = payload
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_uppercase();
+                    let parts = message_parts(payload.get("content"), image_idx, false);
+                    let body = if parts.is_empty() {
+                        "(empty message)".to_string()
+                    } else {
+                        parts.join("\n")
+                    };
+                    Some(markdown_section(ts, &role, &body))
+                }
+                "function_call" => {
+                    let name = payload.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                    let args = parse_json_maybe(payload.get("arguments"));
+                    Some(markdown_section(
+                        ts,
+                        &format!("TOOL_CALL `{}`", inline_code(name)),
+                        &format!("{}", markdown_fence("json", &safe_json(&args))),
+                    ))
+                }
+                "function_call_output" => {
+                    let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                    let output = parse_json_maybe(payload.get("output"));
+                    Some(markdown_section(
+                        ts,
+                        &format!("TOOL_OUTPUT `{}`", inline_code(call_id)),
+                        &format!("{}", markdown_fence("json", &safe_json(&output))),
+                    ))
+                }
+                _ => Some(markdown_section(
+                    ts,
+                    &format!("RESPONSE_ITEM {}", ptype),
+                    &markdown_fence("json", &safe_json(payload)),
+                )),
+            }
+        }
+        "" => None,
+        other => Some(markdown_section(
+            ts,
+            &other.to_uppercase(),
+            &markdown_fence("json", &safe_json(payload.unwrap_or(&Value::Null))),
+        )),
+    }
+}
+
+fn message_parts(content: Option<&Value>, image_idx: &mut usize, scrub_noise: bool) -> Vec<String> {
+    let mut parts = Vec::new();
+    let Some(items) = content.and_then(Value::as_array) else {
+        return parts;
+    };
+
+    for item in items {
+        let Some(itype) = item.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match itype {
+            "input_text" | "output_text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    let cleaned = if scrub_noise {
+                        scrub_noise_lines(text)
+                    } else {
+                        text.to_string()
+                    };
+                    if !cleaned.trim().is_empty() {
+                        parts.push(escape_heading_lines(&cleaned));
+                    }
+                }
+            }
+            "input_image" => {
+                *image_idx += 1;
+                parts.push(image_name(item, *image_idx));
+            }
+            _ => parts.push(safe_json(item)),
+        }
+    }
+
+    parts
+}
+
+fn escape_heading_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                let indent = line.len().saturating_sub(trimmed.len());
+                let mut out = String::new();
+                out.push_str(&line[..indent]);
+                out.push('\\');
+                out.push_str(trimmed);
+                out
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn image_name(item: &Value, idx: usize) -> String {
+    for key in ["name", "filename", "file_name", "path"] {
+        if let Some(v) = item.get(key).and_then(Value::as_str) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+
+    let url_text = item
+        .get("image_url")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.as_str()),
+            Value::Object(_) => v.get("url").and_then(Value::as_str),
+            _ => None,
+        })
+        .unwrap_or("");
+    if !url_text.is_empty() && !url_text.starts_with("data:") {
+        let without_query = url_text.split('?').next().unwrap_or(url_text);
+        let base = without_query.rsplit('/').next().unwrap_or(without_query);
+        if !base.is_empty() {
+            return base.to_string();
+        }
+    }
+
+    format!("image_{:03}", idx)
+}
+
+fn parse_json_maybe(value: Option<&Value>) -> Value {
+    let Some(v) = value else {
+        return Value::Null;
+    };
+
+    match v {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone())),
+        _ => v.clone(),
+    }
+}
+
+fn safe_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn value_as_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => one_line_value(other, 200, 0),
+    }
+}
+
+fn event_label(payload: &Value) -> String {
+    let Some(map) = payload.as_object() else {
+        return String::new();
+    };
+
+    if let Some(msg) = map.get("msg").and_then(Value::as_object) {
+        for key in ["type", "name", "event"] {
+            if let Some(v) = msg.get(key).and_then(Value::as_str) {
+                if !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+
+    for key in ["type", "name", "event"] {
+        if let Some(v) = map.get(key).and_then(Value::as_str) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn is_medium_event_worthy(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    let l = label.to_ascii_lowercase();
+    l.contains("error") || l.contains("fail") || l.contains("panic")
+}
+
+fn is_auto_system_status_message(parts: &[String]) -> bool {
+    let text = parts.join("\n");
+    text.contains("== System Status ==") && text.contains("[automatic message added by system]")
+}
+
+fn duration_seconds(duration: Option<&Value>) -> Option<f64> {
+    let obj = duration?.as_object()?;
+    let secs = obj.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
+    let nanos = obj.get("nanos").and_then(Value::as_f64).unwrap_or(0.0);
+    Some(secs + nanos / 1_000_000_000.0)
+}
+
+fn format_medium_event(payload: &Value, max_len: usize) -> String {
+    let Some(map) = payload.as_object() else {
+        return one_line_value(payload, max_len, 0);
+    };
+
+    let msg = map.get("msg");
+    if let Some(msg_obj) = msg.and_then(Value::as_object) {
+        let mtype = msg_obj.get("type").and_then(Value::as_str).unwrap_or("");
+        if mtype == "mcp_tool_call_begin" || mtype == "mcp_tool_call_end" {
+            let mut parts = Vec::new();
+            let invocation = msg_obj.get("invocation").and_then(Value::as_object);
+
+            let mut header = Vec::new();
+            if let Some(v) = msg_obj.get("call_id").and_then(Value::as_str) {
+                if !v.is_empty() {
+                    header.push(format!("call_id={}", v));
+                }
+            }
+            if let Some(inv) = invocation {
+                if let Some(v) = inv.get("server").and_then(Value::as_str) {
+                    if !v.is_empty() {
+                        header.push(format!("server={}", v));
+                    }
+                }
+                if let Some(v) = inv.get("tool").and_then(Value::as_str) {
+                    if !v.is_empty() {
+                        header.push(format!("tool={}", v));
+                    }
+                }
+
+                if let Some(args) = inv.get("arguments") {
+                    if !args.is_null() {
+                        parts.push(format!("arguments={}", one_line_value(args, max_len, 0)));
+                    }
+                }
+            }
+
+            if !header.is_empty() {
+                parts.insert(0, header.join(" "));
+            }
+
+            if mtype == "mcp_tool_call_end" {
+                if let Some(dur) = duration_seconds(msg_obj.get("duration")) {
+                    parts.push(format!("duration_s={:.3}", dur));
+                }
+
+                if let Some(result) = msg_obj.get("result") {
+                    let compact_result = result
+                        .get("Ok")
+                        .and_then(Value::as_object)
+                        .and_then(|ok| ok.get("structuredContent"))
+                        .unwrap_or(result);
+                    if !compact_result.is_null() {
+                        parts.push(format!("result={}", one_line_value(compact_result, max_len, 0)));
+                    }
+                }
+            }
+
+            if !parts.is_empty() {
+                return parts.join("\n");
+            }
+        }
+
+        return one_line_value(&Value::Object(msg_obj.clone()), max_len, 0);
+    }
+
+    one_line_value(payload, max_len, 0)
+}
+
+fn extract_reasoning_summaries(payload: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let summary = payload.get("summary");
+    let entries: Vec<&Value> = match summary {
+        Some(Value::Array(arr)) => arr.iter().collect(),
+        Some(v) => vec![v],
+        None => vec![],
+    };
+
+    for item in entries {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            let cleaned = text.trim();
+            if !cleaned.is_empty() {
+                out.push(cleaned.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+fn one_line_value(value: &Value, max_len: usize, depth: usize) -> String {
+    if depth > 3 {
+        return "...".to_string();
+    }
+
+    match value {
+        Value::Null => "{}".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(s) => shorten(&collapse_ws(&scrub_noise_lines(s)), max_len),
+        Value::Array(arr) => {
+            let mut parts = Vec::new();
+            for (i, item) in arr.iter().enumerate() {
+                if i >= 6 {
+                    parts.push("...".to_string());
+                    break;
+                }
+                parts.push(one_line_value(item, 40, depth + 1));
+            }
+            shorten(&format!("[{}]", parts.join(", ")), max_len)
+        }
+        Value::Object(map) => {
+            let mut parts = Vec::new();
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i >= 8 {
+                    parts.push("...".to_string());
+                    break;
+                }
+                parts.push(format!("{}={}", k, one_line_value(v, 60, depth + 1)));
+            }
+            shorten(&parts.join(" "), max_len)
+        }
+    }
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn scrub_noise_lines(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.contains("encrypted_content=")
+                && !trimmed.contains("\"encrypted_content\"")
+                && trimmed != "content={}"
+        })
+        .collect();
+
+    if kept.is_empty() {
+        text.to_string()
+    } else {
+        kept.join("\n")
+    }
+}
+
+fn summarize_tool_output(value: &Value, max_len: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(obj) = value.as_object() {
+        if let Some(meta) = obj.get("metadata").and_then(Value::as_object) {
+            if let Some(code) = meta.get("exit_code") {
+                lines.push(format!("- exit_code: {}", one_line_value(code, 40, 0)));
+            }
+            if let Some(dur) = meta.get("duration_seconds") {
+                lines.push(format!("- duration_s: {}", one_line_value(dur, 40, 0)));
+            }
+        }
+        if let Some(output) = obj.get("output") {
+            lines.push(format!("- output: {}", one_line_value(output, max_len, 0)));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(format!("- output: {}", one_line_value(value, max_len, 0)));
+    }
+
+    lines.join("\n")
+}
+
+fn shorten(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_string();
+    }
+    if max_len <= 3 {
+        return "...".to_string();
+    }
+    let mut out = text.chars().take(max_len - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reasoning_medium_uses_full_summary_and_skips_encrypted() {
+        let payload: Value = serde_json::json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "**Inspecting repo and test commands**"}],
+            "content": null,
+            "encrypted_content": "super-secret"
+        });
+
+        let mut img = 0usize;
+        let rendered = render_medium_response_item("2026-03-06T15:17:06.776Z", Some(&payload), &mut img, 240)
+            .expect("rendered");
+
+        assert!(rendered.contains("### [2026-03-06T15:17:06.776Z] REASONING"));
+        assert!(rendered.contains("> **Inspecting repo and test commands**"));
+        assert!(!rendered.contains("encrypted_content"));
+        assert!(!rendered.contains("content={}"));
+    }
+
+    #[test]
+    fn export_medium_end_to_end_writes_reasoning_summary() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/06");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "79fe0ea5-f15d-4b40-88fb-15e9b4dd2991";
+        let rollout_rel = format!(
+            "sessions/2026/03/06/rollout-2026-03-06T15-16-48-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-03-06T15:16:48.748Z",
+            "type": "session_meta",
+            "payload": {
+                "timestamp": "2026-03-06T15:16:48.677Z",
+                "cwd": "/home/wavy/ai/b-revamp",
+                "originator": "code_cli_rs",
+                "cli_version": "0.0.0"
+            }
+        });
+        let reasoning = serde_json::json!({
+            "timestamp": "2026-03-06T15:17:06.776Z",
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "**Inspecting repo and test commands**"}],
+                "content": null,
+                "encrypted_content": "abc"
+            }
+        });
+        let message = serde_json::json!({
+            "timestamp": "2026-03-06T15:17:06.800Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        });
+
+        let jsonl = format!("{}\n{}\n{}\n", session_meta, reasoning, message);
+        fs::write(&rollout_path, jsonl).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert!(body.contains("Export Mode: medium"));
+        assert!(body.contains("### [2026-03-06T15:17:06.776Z] REASONING"));
+        assert!(body.contains("> **Inspecting repo and test commands**"));
+        assert!(!body.contains("encrypted_content"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn medium_escapes_markdown_headings_inside_messages() {
+        let payload: Value = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "### heading\nnormal line"}]
+        });
+
+        let mut img = 0usize;
+        let rendered = render_medium_response_item("2026-03-07T15:45:37.004Z", Some(&payload), &mut img, 180)
+            .expect("rendered");
+
+        assert!(rendered.contains("\\### heading"));
+        assert!(!rendered.contains("\n### heading\n"));
+        assert!(rendered.contains("normal line"));
+    }
+
+    #[test]
+    fn medium_coalesces_tool_call_and_output() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-tool-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "11111111-1111-1111-1111-111111111111";
+        let rollout_rel = format!(
+            "sessions/2026/03/07/rollout-2026-03-07T15-00-00-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let function_call = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "call_abc",
+                "arguments": "{\"command\":[\"bash\",\"-lc\",\"cargo test\"],\"workdir\":\"/home/wavy/ai/b-revamp\"}"
+            }
+        });
+        let function_output = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": "{\"output\":\"this output is intentionally long to be omitted in medium mode because successful commands should stay concise and focused\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":1.2}}"
+            }
+        });
+
+        let jsonl = format!("{}\n{}\n", function_call, function_output);
+        fs::write(&rollout_path, jsonl).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert!(body.contains("TOOL `shell`"));
+        assert!(body.contains("- call: cargo test"));
+        assert!(body.contains("- exit_code: 0"));
+        assert!(!body.contains("- output:"));
+        assert!(!body.contains("TOOL_CALL `shell`"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

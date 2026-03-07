@@ -24,6 +24,10 @@ use regex::Regex;
 use strfmt::strfmt;
 use which::which;
 
+pub mod exporter;
+
+use crate::exporter::ExportMode;
+
 static VALID_NAME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9._:-]+$").expect("valid"));
 static INVALID_CHARS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[^A-Za-z0-9._:-]+").expect("valid"));
@@ -160,19 +164,11 @@ enum ExportDepth {
 }
 
 impl ExportDepth {
-    fn cx_flag(self) -> Option<&'static str> {
+    fn export_mode(self) -> ExportMode {
         match self {
-            ExportDepth::Compact => None,
-            ExportDepth::Medium => Some("--medium"),
-            ExportDepth::Full => Some("--full"),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            ExportDepth::Compact => "compact",
-            ExportDepth::Medium => "medium",
-            ExportDepth::Full => "full",
+            ExportDepth::Compact => ExportMode::Compact,
+            ExportDepth::Medium => ExportMode::Medium,
+            ExportDepth::Full => ExportMode::Full,
         }
     }
 }
@@ -644,6 +640,20 @@ fn export_out_path() -> PathBuf {
     }
 }
 
+fn export_code_dir() -> PathBuf {
+    if let Ok(v) = env::var("BR_CODE_DIR") {
+        if !v.trim().is_empty() {
+            return expand_path(&v);
+        }
+    }
+    if let Ok(v) = env::var("CX_CODE_DIR") {
+        if !v.trim().is_empty() {
+            return expand_path(&v);
+        }
+    }
+    expand_path("~/.code")
+}
+
 fn start_export_prompt(app: &mut App) {
     let Some(name) = app.selected_name().map(|s| s.to_string()) else {
         app.set_status_for("No session selected", Duration::from_millis(1000));
@@ -656,7 +666,7 @@ fn start_export_prompt(app: &mut App) {
     });
     app.set_status_for(
         format!(
-            "Export '{}' as [1]compact [2]medium [3]full (Enter=compact, Esc cancel)",
+            "Export '{}' as [1]compact [2]medium [3]full (Enter=medium, Esc cancel)",
             name
         ),
         Duration::from_secs(8),
@@ -675,40 +685,14 @@ fn export_session_markdown(app: &mut App, name: &str, depth: ExportDepth) {
     };
 
     let out_path = export_out_path();
-    let mut args = vec![session_id.clone()];
-    if let Some(flag) = depth.cx_flag() {
-        args.push(flag.to_string());
-    }
-    args.push("--out".to_string());
-    args.push(out_path.display().to_string());
+    let code_dir = export_code_dir();
 
-    match run_capture("cx", &args, None) {
-        Ok(out) if out.code == 0 => {
-            let message = out
-                .stdout
-                .lines()
-                .find(|line| line.trim_start().starts_with("Wrote:"))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| format!("Exported {} ({})", session_id, depth.label()));
-            app.set_status_for(message, Duration::from_secs(3));
-        }
-        Ok(out) => {
-            let detail = out
-                .stderr
-                .lines()
-                .last()
-                .or_else(|| out.stdout.lines().last())
-                .unwrap_or("cx failed");
-            app.set_status_for(
-                format!("Export failed: {}", detail.trim()),
-                Duration::from_secs(3),
-            );
+    match exporter::export_session_markdown(&session_id, &out_path, depth.export_mode(), &code_dir) {
+        Ok(path) => {
+            app.set_status_for(format!("Wrote: {}", path.display()), Duration::from_secs(3));
         }
         Err(err) => {
-            app.set_status_for(
-                format!("Export failed: {}", err.msg.trim_end()),
-                Duration::from_secs(3),
-            );
+            app.set_status_for(format!("Export failed: {}", err), Duration::from_secs(3));
         }
     }
 }
@@ -1439,7 +1423,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             let name = pending.name.clone();
             match key.code {
                 KeyCode::Enter => {
-                    export_session_markdown(app, &name, ExportDepth::Compact);
+                    export_session_markdown(app, &name, ExportDepth::Medium);
                     return None;
                 }
                 KeyCode::Char('1') | KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -1849,8 +1833,8 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
             vec![
                 format!("Session: {}", pending.name),
                 "".to_string(),
-                "Enter / 1 / c  -> compact".to_string(),
-                "2 / m          -> medium".to_string(),
+                "Enter / 2 / m  -> medium".to_string(),
+                "1 / c          -> compact".to_string(),
                 "3 / f          -> full".to_string(),
                 "Esc / n / q    -> cancel".to_string(),
             ],
@@ -2287,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn export_prompt_enter_defaults_to_compact() {
+    fn export_prompt_enter_defaults_to_medium() {
         let mut app = test_app();
 
         let _ = handle_filter_mode(

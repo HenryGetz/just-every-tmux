@@ -22,6 +22,7 @@ cargo build --release
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/target/release/br" ~/.local/bin/br
 ln -sf "$(pwd)/target/release/b" ~/.local/bin/b
+ln -sf "$(pwd)/target/release/cx" ~/.local/bin/cx
 ```
 
 Then make sure `~/.local/bin` is in your `PATH`.
@@ -52,6 +53,13 @@ br
 - `Ctrl+S`: export session transcript markdown
 - `q`: quit
 
+Direct exporter CLI (self-contained in this repo):
+
+```bash
+cx <session-id> --medium
+cx <session-id> --full --out ~/coder-md
+```
+
 Yes, you can still use raw `tmux` commands manually if you miss suffering.
 
 ## Environment knobs
@@ -63,6 +71,8 @@ Yes, you can still use raw `tmux` commands manually if you miss suffering.
 - `BR_REPO`: explicit repo root (overrides autodetect)
 - `BR_VERBOSE`: print diagnostics
 - `BR_MODE`: force mode (`worktree` or `cwd`)
+- `BR_EXPORT_OUT`: export directory for `Ctrl+S` (default: `~/coder-md`)
+- `BR_CODE_DIR`: code data dir for exports (default: `~/.code`)
 
 ## Requirements
 
