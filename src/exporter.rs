@@ -11,6 +11,7 @@ pub enum ExportMode {
     Compact,
     Medium,
     Full,
+    Json,
 }
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,7 @@ impl ExportMode {
             ExportMode::Compact => "compact",
             ExportMode::Medium => "medium",
             ExportMode::Full => "full",
+            ExportMode::Json => "json",
         }
     }
 }
@@ -89,7 +91,8 @@ pub fn export_session_markdown(
                     last_written_block = Some(rendered);
                 }
             }
-            ExportMode::Medium => {
+            export_mode @ (ExportMode::Medium | ExportMode::Full) => {
+                let detailed_calls = matches!(export_mode, ExportMode::Full);
                 if otype == "response_item" {
                     let payload = obj.get("payload");
                     let ptype = payload
@@ -98,7 +101,7 @@ pub fn export_session_markdown(
                         .unwrap_or("");
 
                     if ptype == "function_call" {
-                        if let Some((call_id, call)) = capture_medium_tool_call(payload, 140) {
+                        if let Some((call_id, call)) = capture_medium_tool_call(payload, 140, detailed_calls) {
                             pending_medium_calls.insert(call_id, call);
                         }
                         continue;
@@ -118,9 +121,7 @@ pub fn export_session_markdown(
                             }
                             medium_output_sigs.insert(call_id.clone(), sig);
                         }
-                        if let Some(rendered) =
-                            render_medium_tool_output(ts, payload, paired_call, 180)
-                        {
+                        if let Some(rendered) = render_medium_tool_output(ts, payload, paired_call, 180) {
                             if last_written_block.as_deref() == Some(rendered.as_str()) {
                                 continue;
                             }
@@ -173,7 +174,7 @@ pub fn export_session_markdown(
                     last_medium_reasoning_key = None;
                 }
             }
-            ExportMode::Full => {
+            ExportMode::Json => {
                 if let Some(rendered) = render_full_item(ts, otype, obj.get("payload"), &mut image_idx) {
                     if last_written_block.as_deref() == Some(rendered.as_str()) {
                         continue;
@@ -362,7 +363,11 @@ fn medium_reasoning_key(payload: Option<&Value>) -> Option<String> {
     Some(summaries.join("\n\n"))
 }
 
-fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(String, MediumToolCall)> {
+fn capture_medium_tool_call(
+    payload: Option<&Value>,
+    max_len: usize,
+    detailed_calls: bool,
+) -> Option<(String, MediumToolCall)> {
     let payload = payload?;
     if payload.get("type").and_then(Value::as_str) != Some("function_call") {
         return None;
@@ -375,7 +380,7 @@ fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(
         .unwrap_or("unknown")
         .to_string();
     let args = parse_json_maybe(payload.get("arguments"));
-    let call_markdown = summarize_tool_call(&name, &args, max_len);
+    let call_markdown = summarize_tool_call(&name, &args, max_len, detailed_calls);
 
     Some((
         call_id,
@@ -386,7 +391,7 @@ fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(
     ))
 }
 
-fn summarize_tool_call(name: &str, args: &Value, _max_len: usize) -> String {
+fn summarize_tool_call(name: &str, args: &Value, max_len: usize, detailed_calls: bool) -> String {
     if name == "update_plan" {
         return format_update_plan_call(args);
     }
@@ -413,6 +418,11 @@ fn summarize_tool_call(name: &str, args: &Value, _max_len: usize) -> String {
         let collapsed = collapse_ws(&command_text);
         if collapsed.contains("apply_patch") {
             return "- call: `apply_patch <patch>`".to_string();
+        }
+
+        if !detailed_calls {
+            let summary = truncate_with_indicator(&collapsed, max_len.max(40));
+            return format!("- call: `{}`", inline_code(&summary));
         }
 
         let mut lines = Vec::new();
@@ -462,6 +472,16 @@ fn format_update_plan_call(args: &Value) -> String {
     }
 
     lines.join("\n")
+}
+
+fn truncate_with_indicator(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_string();
+    }
+
+    let kept: String = text.chars().take(max_len).collect();
+    let remaining = text.chars().count().saturating_sub(max_len);
+    format!("{} (+{} chars)", kept.trim_end(), remaining)
 }
 
 fn render_medium_tool_output(
@@ -1130,10 +1150,74 @@ mod tests {
         let body = fs::read_to_string(&out_file).expect("read output");
 
         assert!(body.contains("TOOL `shell`"));
-        assert!(body.contains("- call:\n```bash\ncargo test\n```"));
+        assert!(body.contains("- call: `cargo test`"));
         assert!(body.contains("- exit_code: 0"));
         assert!(!body.contains("- output:"));
         assert!(!body.contains("TOOL_CALL `shell`"));
+        assert!(!body.contains("```bash"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_keeps_detailed_shell_call_and_output() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-full-tool-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "11111111-1111-1111-1111-111111111112";
+        let rollout_rel = format!(
+            "sessions/2026/03/07/rollout-2026-03-07T15-00-00-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let function_call = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "call_abc",
+                "arguments": "{\"command\":[\"bash\",\"-lc\",\"cargo test\"],\"workdir\":\"/home/wavy/ai/b-revamp\"}"
+            }
+        });
+        let function_output = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": "{\"output\":\"ok\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":1.2}}"
+            }
+        });
+
+        let jsonl = format!("{}\n{}\n", function_call, function_output);
+        fs::write(&rollout_path, jsonl).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Full, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert!(body.contains("TOOL `shell`"));
+        assert!(body.contains("- cwd: `/home/wavy/ai/b-revamp`"));
+        assert!(body.contains("```bash\ncargo test\n```"));
+        assert!(body.contains("- exit_code: 0"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1200,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn medium_shell_call_summary_keeps_full_command() {
+    fn full_shell_call_summary_keeps_full_command() {
         let args: Value = serde_json::json!({
             "command": [
                 "bash",
@@ -1210,9 +1294,26 @@ mod tests {
             "workdir": "/tmp"
         });
 
-        let summary = summarize_tool_call("shell", &args, 40);
+        let summary = summarize_tool_call("shell", &args, 40, true);
         assert!(summary.contains("SENTINEL_END"));
-        assert!(!summary.ends_with("..."));
+        assert!(summary.contains("```bash"));
+    }
+
+    #[test]
+    fn medium_shell_call_summary_is_abbreviated() {
+        let args: Value = serde_json::json!({
+            "command": [
+                "bash",
+                "-lc",
+                "set -euo pipefail base=\"evidence/2026-03-03/revision-matrix\" mkdir -p \"$base\" echo SENTINEL_END"
+            ],
+            "workdir": "/tmp"
+        });
+
+        let summary = summarize_tool_call("shell", &args, 40, false);
+        assert!(summary.contains("- call: `set -euo pipefail"));
+        assert!(summary.contains("(+"));
+        assert!(!summary.contains("```bash"));
     }
 
     #[test]
@@ -1225,7 +1326,7 @@ mod tests {
             ]
         });
 
-        let summary = summarize_tool_call("update_plan", &args, 40);
+        let summary = summarize_tool_call("update_plan", &args, 40, false);
         assert!(summary.contains("- plan: Version Recon + Docs"));
         assert!(summary.contains("- [ ] Run torsocks-only version probes (in progress)"));
         assert!(summary.contains("torsocks-only version probes"));

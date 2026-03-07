@@ -161,6 +161,7 @@ enum ExportDepth {
     Compact,
     Medium,
     Full,
+    Json,
 }
 
 impl ExportDepth {
@@ -169,6 +170,7 @@ impl ExportDepth {
             ExportDepth::Compact => ExportMode::Compact,
             ExportDepth::Medium => ExportMode::Medium,
             ExportDepth::Full => ExportMode::Full,
+            ExportDepth::Json => ExportMode::Json,
         }
     }
 }
@@ -666,7 +668,7 @@ fn start_export_prompt(app: &mut App) {
     });
     app.set_status_for(
         format!(
-            "Export '{}' as [1]compact [2]medium [3]full (Enter=medium, Esc cancel)",
+            "Export '{}' as [1]compact [2]medium [3]full [4]json (Enter=medium, Esc cancel)",
             name
         ),
         Duration::from_secs(8),
@@ -1438,6 +1440,10 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                     export_session_markdown(app, &name, ExportDepth::Full);
                     return None;
                 }
+                KeyCode::Char('4') | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    export_session_markdown(app, &name, ExportDepth::Json);
+                    return None;
+                }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Char('Q') => {
                     app.pending_export = None;
                     app.set_status_for("Export canceled.", Duration::from_millis(900));
@@ -1445,7 +1451,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                 }
                 _ => {
                     app.set_status_for(
-                        "Choose Enter/1/2/3 or c/m/f (Esc cancel)",
+                        "Choose Enter/1/2/3/4 or c/m/f/j (Esc cancel)",
                         Duration::from_millis(900),
                     );
                     return None;
@@ -1836,6 +1842,7 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
                 "Enter / 2 / m  -> medium".to_string(),
                 "1 / c          -> compact".to_string(),
                 "3 / f          -> full".to_string(),
+                "4 / j          -> json".to_string(),
                 "Esc / n / q    -> cancel".to_string(),
             ],
         ));

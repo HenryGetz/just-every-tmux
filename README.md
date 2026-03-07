@@ -58,7 +58,15 @@ Direct exporter CLI (self-contained in this repo):
 ```bash
 cx <session-id> --medium
 cx <session-id> --full --out ~/coder-md
+cx <session-id> --json --out ~/coder-md
 ```
+
+Export modes:
+
+- `compact`: user + assistant messages only
+- `medium`: readable transcript with abbreviated tool calls (planning stays checklist-style)
+- `full`: readable transcript with detailed tool call bodies
+- `json`: JSON-heavy dump for maximal fidelity
 
 Yes, you can still use raw `tmux` commands manually if you miss suffering.
 

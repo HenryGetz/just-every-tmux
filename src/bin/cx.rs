@@ -17,7 +17,7 @@ fn expand_path(path: &str) -> PathBuf {
 
 fn usage() {
     eprintln!(
-        "cx (rust)\n\nUsage:\n  cx <session-id> [--out <dir|file.md>] [--code-dir <dir>] [--compact|--medium|--full]\n\nDefaults:\n  --out ~/coder-md\n  --code-dir ~/.code\n  --compact\n"
+        "cx (rust)\n\nUsage:\n  cx <session-id> [--out <dir|file.md>] [--code-dir <dir>] [--compact|--medium|--full|--json]\n\nDefaults:\n  --out ~/coder-md\n  --code-dir ~/.code\n  --compact\n"
     );
 }
 
@@ -52,6 +52,7 @@ fn main() {
             "--compact" => mode = ExportMode::Compact,
             "--medium" => mode = ExportMode::Medium,
             "--full" => mode = ExportMode::Full,
+            "--json" => mode = ExportMode::Json,
             value if value.starts_with('-') => {
                 eprintln!("Unknown flag: {}", value);
                 std::process::exit(2);
@@ -82,4 +83,3 @@ fn main() {
         }
     }
 }
-
