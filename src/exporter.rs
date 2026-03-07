@@ -68,6 +68,7 @@ pub fn export_session_markdown(
     let mut last_written_block: Option<String> = None;
     let mut pending_medium_calls: HashMap<String, MediumToolCall> = HashMap::new();
     let mut medium_output_sigs: HashMap<String, String> = HashMap::new();
+    let mut last_medium_reasoning_key: Option<String> = None;
 
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -125,7 +126,15 @@ pub fn export_session_markdown(
                             }
                             out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
                             last_written_block = Some(rendered);
+                            last_medium_reasoning_key = None;
                         }
+                        continue;
+                    }
+
+                    let reasoning_key = medium_reasoning_key(payload);
+                    if reasoning_key.is_some()
+                        && last_medium_reasoning_key.as_deref() == reasoning_key.as_deref()
+                    {
                         continue;
                     }
 
@@ -135,6 +144,7 @@ pub fn export_session_markdown(
                         }
                         out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
                         last_written_block = Some(rendered);
+                        last_medium_reasoning_key = reasoning_key;
                     }
                 } else if otype == "event" {
                     let payload = obj.get("payload").cloned().unwrap_or(Value::Null);
@@ -160,6 +170,7 @@ pub fn export_session_markdown(
                     }
                     out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
                     last_written_block = Some(rendered);
+                    last_medium_reasoning_key = None;
                 }
             }
             ExportMode::Full => {
@@ -321,15 +332,14 @@ fn render_medium_response_item(
         }
         "reasoning" => {
             let summaries = extract_reasoning_summaries(payload);
-            let body = if summaries.is_empty() {
-                "(no reasoning summary)".to_string()
-            } else {
-                summaries
-                    .iter()
-                    .map(|s| markdown_blockquote(s))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            };
+            if summaries.is_empty() {
+                return None;
+            }
+            let body = summaries
+                .iter()
+                .map(|s| markdown_blockquote(s))
+                .collect::<Vec<_>>()
+                .join("\n\n");
             Some(markdown_section(ts, "REASONING", &body))
         }
         _ => Some(markdown_section(
@@ -338,6 +348,18 @@ fn render_medium_response_item(
             &format!("- payload: {}", one_line_value(payload, max_len, 0)),
         )),
     }
+}
+
+fn medium_reasoning_key(payload: Option<&Value>) -> Option<String> {
+    let payload = payload?;
+    if payload.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return None;
+    }
+    let summaries = extract_reasoning_summaries(payload);
+    if summaries.is_empty() {
+        return None;
+    }
+    Some(summaries.join("\n\n"))
 }
 
 fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(String, MediumToolCall)> {
@@ -382,7 +404,7 @@ fn summarize_tool_call(name: &str, args: &Value, max_len: usize) -> String {
         if collapsed.contains("apply_patch") {
             return "apply_patch <patch>".to_string();
         }
-        return shorten(&collapsed, max_len);
+        return collapsed;
     }
 
     let compact_args = collapse_ws(&one_line_value(args, max_len, 0));
@@ -898,6 +920,20 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_medium_skips_empty_summary() {
+        let payload: Value = serde_json::json!({
+            "type": "reasoning",
+            "summary": [],
+            "content": null,
+            "encrypted_content": "super-secret"
+        });
+
+        let mut img = 0usize;
+        let rendered = render_medium_response_item("2026-03-06T15:17:06.776Z", Some(&payload), &mut img, 240);
+        assert!(rendered.is_none());
+    }
+
+    #[test]
     fn export_medium_end_to_end_writes_reasoning_summary() {
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1049,5 +1085,82 @@ mod tests {
         assert!(!body.contains("TOOL_CALL `shell`"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn medium_dedupes_consecutive_reasoning_with_different_metadata() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-reasoning-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "22222222-2222-2222-2222-222222222222";
+        let rollout_rel = format!(
+            "sessions/2026/03/07/rollout-2026-03-07T16-00-00-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let reasoning_a = serde_json::json!({
+            "timestamp": "2026-03-07T16:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "**Duplicate summary**"}],
+                "encrypted_content": "cipher-a"
+            }
+        });
+        let reasoning_b = serde_json::json!({
+            "timestamp": "2026-03-07T16:00:01.200Z",
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "**Duplicate summary**"}],
+                "encrypted_content": "cipher-b"
+            }
+        });
+
+        let jsonl = format!("{}\n{}\n", reasoning_a, reasoning_b);
+        fs::write(&rollout_path, jsonl).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert_eq!(body.matches("### [2026-03-07T16:00:01.").count(), 1);
+        assert_eq!(body.matches("**Duplicate summary**").count(), 1);
+        assert!(!body.contains("cipher-"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn medium_shell_call_summary_keeps_full_command() {
+        let args: Value = serde_json::json!({
+            "command": [
+                "bash",
+                "-lc",
+                "set -euo pipefail base=\"evidence/2026-03-03/revision-matrix\" mkdir -p \"$base\" echo SENTINEL_END"
+            ],
+            "workdir": "/tmp"
+        });
+
+        let summary = summarize_tool_call("shell", &args, 40);
+        assert!(summary.contains("SENTINEL_END"));
+        assert!(!summary.ends_with("..."));
     }
 }
