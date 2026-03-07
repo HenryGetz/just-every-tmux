@@ -380,7 +380,7 @@ fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(
     Some((call_id, MediumToolCall { name, summary }))
 }
 
-fn summarize_tool_call(name: &str, args: &Value, max_len: usize) -> String {
+fn summarize_tool_call(name: &str, args: &Value, _max_len: usize) -> String {
     if name == "shell" {
         let command = args
             .get("command")
@@ -407,8 +407,9 @@ fn summarize_tool_call(name: &str, args: &Value, max_len: usize) -> String {
         return collapsed;
     }
 
-    let compact_args = collapse_ws(&one_line_value(args, max_len, 0));
-    shorten(&format!("{} {}", name, compact_args), max_len)
+    let compact_args = serde_json::to_string(args).unwrap_or_else(|_| safe_json(args));
+    let compact_args = collapse_ws(&compact_args);
+    format!("{} {}", name, compact_args)
 }
 
 fn render_medium_tool_output(
@@ -804,7 +805,7 @@ fn extract_reasoning_summaries(payload: &Value) -> Vec<String> {
 
 fn one_line_value(value: &Value, max_len: usize, depth: usize) -> String {
     if depth > 3 {
-        return "...".to_string();
+        return "<depth-limit>".to_string();
     }
 
     match value {
@@ -816,7 +817,6 @@ fn one_line_value(value: &Value, max_len: usize, depth: usize) -> String {
             let mut parts = Vec::new();
             for (i, item) in arr.iter().enumerate() {
                 if i >= 6 {
-                    parts.push("...".to_string());
                     break;
                 }
                 parts.push(one_line_value(item, 40, depth + 1));
@@ -827,7 +827,6 @@ fn one_line_value(value: &Value, max_len: usize, depth: usize) -> String {
             let mut parts = Vec::new();
             for (i, (k, v)) in map.iter().enumerate() {
                 if i >= 8 {
-                    parts.push("...".to_string());
                     break;
                 }
                 parts.push(format!("{}={}", k, one_line_value(v, 60, depth + 1)));
@@ -887,12 +886,10 @@ fn shorten(text: &str, max_len: usize) -> String {
     if text.chars().count() <= max_len {
         return text.to_string();
     }
-    if max_len <= 3 {
-        return "...".to_string();
+    if max_len == 0 {
+        return String::new();
     }
-    let mut out = text.chars().take(max_len - 3).collect::<String>();
-    out.push_str("...");
-    out
+    text.chars().take(max_len).collect::<String>()
 }
 
 #[cfg(test)]
@@ -1162,5 +1159,20 @@ mod tests {
         let summary = summarize_tool_call("shell", &args, 40);
         assert!(summary.contains("SENTINEL_END"));
         assert!(!summary.ends_with("..."));
+    }
+
+    #[test]
+    fn medium_update_plan_call_summary_has_no_ellipsis() {
+        let args: Value = serde_json::json!({
+            "name": "Version Recon + Docs",
+            "plan": [
+                {"step": "Run torsocks-only version probes", "status": "in_progress"},
+                {"step": "Extract verifiable version indicators", "status": "pending"}
+            ]
+        });
+
+        let summary = summarize_tool_call("update_plan", &args, 40);
+        assert!(summary.contains("torsocks-only version probes"));
+        assert!(!summary.contains("..."));
     }
 }
