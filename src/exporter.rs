@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ pub enum ExportMode {
 struct MediumToolCall {
     name: String,
     call_markdown: String,
+    timestamp: String,
 }
 
 impl ExportMode {
@@ -70,6 +71,7 @@ pub fn export_session_markdown(
     let mut last_written_block: Option<String> = None;
     let mut pending_medium_calls: HashMap<String, MediumToolCall> = HashMap::new();
     let mut medium_output_sigs: HashMap<String, String> = HashMap::new();
+    let mut calls_with_output: HashSet<String> = HashSet::new();
     let mut last_medium_reasoning_key: Option<String> = None;
 
     for line in reader.lines() {
@@ -101,7 +103,9 @@ pub fn export_session_markdown(
                         .unwrap_or("");
 
                     if ptype == "function_call" {
-                        if let Some((call_id, call)) = capture_medium_tool_call(payload, 140, detailed_calls) {
+                        if let Some((call_id, call)) =
+                            capture_medium_tool_call(payload, 140, detailed_calls, ts)
+                        {
                             pending_medium_calls.insert(call_id, call);
                         }
                         continue;
@@ -120,6 +124,7 @@ pub fn export_session_markdown(
                                 continue;
                             }
                             medium_output_sigs.insert(call_id.clone(), sig);
+                            calls_with_output.insert(call_id.clone());
                         }
                         if let Some(rendered) = render_medium_tool_output(ts, payload, paired_call, 180) {
                             if last_written_block.as_deref() == Some(rendered.as_str()) {
@@ -183,6 +188,29 @@ pub fn export_session_markdown(
                     last_written_block = Some(rendered);
                 }
             }
+        }
+    }
+
+    if matches!(mode, ExportMode::Medium | ExportMode::Full) {
+        let mut pending_only: Vec<&MediumToolCall> = pending_medium_calls
+            .iter()
+            .filter_map(|(call_id, call)| {
+                if calls_with_output.contains(call_id) {
+                    None
+                } else {
+                    Some(call)
+                }
+            })
+            .collect();
+        pending_only.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        for call in pending_only {
+            let rendered = render_pending_tool_call(call);
+            if last_written_block.as_deref() == Some(rendered.as_str()) {
+                continue;
+            }
+            out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+            last_written_block = Some(rendered);
         }
     }
 
@@ -367,6 +395,7 @@ fn capture_medium_tool_call(
     payload: Option<&Value>,
     max_len: usize,
     detailed_calls: bool,
+    ts: &str,
 ) -> Option<(String, MediumToolCall)> {
     let payload = payload?;
     if payload.get("type").and_then(Value::as_str) != Some("function_call") {
@@ -387,8 +416,17 @@ fn capture_medium_tool_call(
         MediumToolCall {
             name,
             call_markdown,
+            timestamp: ts.to_string(),
         },
     ))
+}
+
+fn render_pending_tool_call(call: &MediumToolCall) -> String {
+    markdown_section(
+        &call.timestamp,
+        &format!("TOOL `{}`", inline_code(&call.name)),
+        &call.call_markdown,
+    )
 }
 
 fn summarize_tool_call(name: &str, args: &Value, max_len: usize, detailed_calls: bool) -> String {
@@ -921,6 +959,13 @@ fn scrub_noise_lines(text: &str) -> String {
 
 fn is_noise_line(line: &str) -> bool {
     let trimmed = line.trim();
+
+    if (trimmed.contains("\"encrypted_content\"") && trimmed.contains("\":"))
+        || (trimmed.contains("\\\"encrypted_content\\\"") && trimmed.contains("\\\":"))
+    {
+        return true;
+    }
+
     let Some((key, value)) = trimmed.split_once('=') else {
         return false;
     };
@@ -1223,6 +1268,57 @@ mod tests {
     }
 
     #[test]
+    fn medium_preserves_tool_call_when_output_missing() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-missing-output-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "11111111-1111-1111-1111-111111111113";
+        let rollout_rel = format!(
+            "sessions/2026/03/07/rollout-2026-03-07T15-00-00-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let function_call = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "call_missing",
+                "arguments": "{\"command\":[\"bash\",\"-lc\",\"echo hello\"],\"workdir\":\"/home/wavy/ai/b-revamp\"}"
+            }
+        });
+
+        fs::write(&rollout_path, format!("{}\n", function_call)).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert!(body.contains("TOOL `shell`"));
+        assert!(body.contains("echo hello"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn medium_dedupes_consecutive_reasoning_with_different_metadata() {
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1343,5 +1439,11 @@ mod tests {
     fn scrub_noise_lines_removes_only_noise_assignments() {
         let text = "keep this line\nencrypted_content=abc\ncontent={}\nkeep final";
         assert_eq!(scrub_noise_lines(text), "keep this line\nkeep final");
+    }
+
+    #[test]
+    fn scrub_noise_lines_removes_json_style_encrypted_content() {
+        let text = "{\"type\":\"reasoning\",\"encrypted_content\":\"abc\"}";
+        assert_eq!(scrub_noise_lines(text), "");
     }
 }
