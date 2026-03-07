@@ -16,7 +16,7 @@ pub enum ExportMode {
 #[derive(Clone, Debug)]
 struct MediumToolCall {
     name: String,
-    summary: String,
+    call_markdown: String,
 }
 
 impl ExportMode {
@@ -375,12 +375,22 @@ fn capture_medium_tool_call(payload: Option<&Value>, max_len: usize) -> Option<(
         .unwrap_or("unknown")
         .to_string();
     let args = parse_json_maybe(payload.get("arguments"));
-    let summary = summarize_tool_call(&name, &args, max_len);
+    let call_markdown = summarize_tool_call(&name, &args, max_len);
 
-    Some((call_id, MediumToolCall { name, summary }))
+    Some((
+        call_id,
+        MediumToolCall {
+            name,
+            call_markdown,
+        },
+    ))
 }
 
 fn summarize_tool_call(name: &str, args: &Value, _max_len: usize) -> String {
+    if name == "update_plan" {
+        return format_update_plan_call(args);
+    }
+
     if name == "shell" {
         let command = args
             .get("command")
@@ -402,14 +412,56 @@ fn summarize_tool_call(name: &str, args: &Value, _max_len: usize) -> String {
         };
         let collapsed = collapse_ws(&command_text);
         if collapsed.contains("apply_patch") {
-            return "apply_patch <patch>".to_string();
+            return "- call: `apply_patch <patch>`".to_string();
         }
-        return collapsed;
+
+        let mut lines = Vec::new();
+        if let Some(workdir) = args.get("workdir").and_then(Value::as_str) {
+            if !workdir.is_empty() {
+                lines.push(format!("- cwd: `{}`", inline_code(workdir)));
+            }
+        }
+        lines.push("- call:".to_string());
+        lines.push(markdown_fence("bash", &command_text).trim_end().to_string());
+        return lines.join("\n");
     }
 
     let compact_args = serde_json::to_string(args).unwrap_or_else(|_| safe_json(args));
     let compact_args = collapse_ws(&compact_args);
-    format!("{} {}", name, compact_args)
+    format!("- call: {} {}", name, compact_args)
+}
+
+fn format_update_plan_call(args: &Value) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(name) = args.get("name").and_then(Value::as_str) {
+        if !name.is_empty() {
+            lines.push(format!("- plan: {}", name));
+        }
+    }
+
+    if let Some(plan) = args.get("plan").and_then(Value::as_array) {
+        for item in plan {
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("pending");
+            let step = item.get("step").and_then(Value::as_str).unwrap_or("(unnamed step)");
+            let mut suffix = String::new();
+            if status == "in_progress" {
+                suffix.push_str(" _(in progress)_");
+            } else if status != "completed" && status != "pending" {
+                suffix.push_str(&format!(" _(status: {})_", status));
+            }
+
+            let mark = if status == "completed" { "x" } else { " " };
+            lines.push(format!("- [{}] {}{}", mark, step, suffix));
+        }
+    }
+
+    if lines.is_empty() {
+        let compact_args = serde_json::to_string(args).unwrap_or_else(|_| safe_json(args));
+        return format!("- call: update_plan {}", collapse_ws(&compact_args));
+    }
+
+    lines.join("\n")
 }
 
 fn render_medium_tool_output(
@@ -428,7 +480,7 @@ fn render_medium_tool_output(
     let mut lines = Vec::new();
 
     if let Some(call) = call {
-        lines.push(format!("- call: {}", call.summary));
+        lines.push(call.call_markdown.clone());
     }
 
     let mut exit_code: Option<i64> = None;
@@ -841,20 +893,22 @@ fn collapse_ws(text: &str) -> String {
 }
 
 fn scrub_noise_lines(text: &str) -> String {
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.contains("encrypted_content=")
-                && !trimmed.contains("\"encrypted_content\"")
-                && trimmed != "content={}"
-        })
-        .collect();
+    text.lines()
+        .filter(|line| !is_noise_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if kept.is_empty() {
-        text.to_string()
-    } else {
-        kept.join("\n")
+fn is_noise_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((key, value)) = trimmed.split_once('=') else {
+        return false;
+    };
+
+    match key.trim() {
+        "encrypted_content" => true,
+        "content" => value.trim() == "{}",
+        _ => false,
     }
 }
 
@@ -1076,7 +1130,7 @@ mod tests {
         let body = fs::read_to_string(&out_file).expect("read output");
 
         assert!(body.contains("TOOL `shell`"));
-        assert!(body.contains("- call: cargo test"));
+        assert!(body.contains("- call:\n```bash\ncargo test\n```"));
         assert!(body.contains("- exit_code: 0"));
         assert!(!body.contains("- output:"));
         assert!(!body.contains("TOOL_CALL `shell`"));
@@ -1172,7 +1226,21 @@ mod tests {
         });
 
         let summary = summarize_tool_call("update_plan", &args, 40);
+        assert!(summary.contains("- plan: Version Recon + Docs"));
+        assert!(summary.contains("- [ ] Run torsocks-only version probes _(in progress)_"));
         assert!(summary.contains("torsocks-only version probes"));
         assert!(!summary.contains("..."));
+    }
+
+    #[test]
+    fn scrub_noise_lines_preserves_mentions() {
+        let text = "Mention encrypted_content in docs\nshow \"encrypted_content\" example";
+        assert_eq!(scrub_noise_lines(text), text);
+    }
+
+    #[test]
+    fn scrub_noise_lines_removes_only_noise_assignments() {
+        let text = "keep this line\nencrypted_content=abc\ncontent={}\nkeep final";
+        assert_eq!(scrub_noise_lines(text), "keep this line\nkeep final");
     }
 }
