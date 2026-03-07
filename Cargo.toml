@@ -1,0 +1,23 @@
+[package]
+name = "b-revamp"
+version = "0.1.0"
+edition = "2021"
+default-run = "b"
+
+[[bin]]
+name = "br"
+path = "src/bin/br.rs"
+
+[[bin]]
+name = "b"
+path = "src/bin/b.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.28"
+once_cell = "1.21"
+ratatui = "0.29"
+regex = "1.11"
+shellexpand = "3.1"
+strfmt = "0.2"
+which = "7.0"
