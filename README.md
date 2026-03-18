@@ -1,76 +1,97 @@
-# `just-every-tmux`
+# just-every-tmux
 
-Because manually juggling tmux sessions by hand is a great way to pretend you love pain.
+`just-every-tmux` is a fast Rust TUI/CLI for managing tmux coding sessions and exporting high-quality session transcripts.
 
-This is a small Rust CLI/TUI for opening, creating, filtering, and cleaning up tmux sessions with less ceremony and fewer typos.
+It gives you three binaries:
 
-For broader context, this project lives in the same ecosystem as [`just-every/code`](https://github.com/just-every/code).
+- `br`: worktree mode (branch + worktree + tmux)
+- `b`: current-directory mode (tmux only)
+- `cx`: transcript exporter for coder sessions
 
-## What you get
+## Platform Support
 
-- `br` mode: opens sessions backed by real Git worktrees under `~/.br/w-<name>` with branch prefix `w/`.
-- `b` mode: opens sessions in your current directory (no worktree setup).
-- Fuzzy TUI that sorts by recency so the thing you *actually* used recently shows up first.
-- Session preview pane, quick kill actions, and markdown export for session logs.
+- Linux: fully supported
+- macOS: fully supported
+- Windows: supported through WSL2 (recommended and documented)
 
-## Install
+For step-by-step setup instructions, use `INSTALL.md`.
+
+## Quick Install (No `cargo run`)
+
+This installs real binaries (`br`, `b`, `cx`) into your user bin directory so you can run them directly.
+
+### Linux/macOS
 
 ```bash
 git clone https://github.com/HenryGetz/just-every-tmux.git
 cd just-every-tmux
-cargo build --release
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/target/release/br" ~/.local/bin/br
-ln -sf "$(pwd)/target/release/b" ~/.local/bin/b
-ln -sf "$(pwd)/target/release/cx" ~/.local/bin/cx
+./install
 ```
 
-Then make sure `~/.local/bin` is in your `PATH`.
-
-## Quick use
+Optional guided installer (simple interactive menu):
 
 ```bash
-# Worktree mode (branch + worktree + tmux)
+./scripts/install-tui.sh
+```
+
+Then restart your shell, or run:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Windows (PowerShell + WSL2)
+
+```powershell
+git clone https://github.com/HenryGetz/just-every-tmux.git
+cd just-every-tmux
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+This installs binaries inside WSL at `~/.local/bin`.
+
+## Quick Start
+
+```bash
+# Worktree mode
 br feature-login
 
-# Current-dir mode (just tmux)
+# Current-directory mode
 b notes
 
-# List sessions (recency sorted)
-br --list
-
-# Open interactive picker
+# Interactive picker
 br
 ```
 
-## Key ideas
+## TUI Keys
 
 - `Enter` / `Space`: open selected session
 - `n` or `F2`: create new session
 - `F3`: toggle preview pane
 - `F8` / `Ctrl+X`: kill selected session (with confirmation)
 - `F9`: force-kill selected session
-- `Ctrl+S`: export session transcript markdown
+- `Ctrl+S`: open export mode chooser
 - `q`: quit
 
-Direct exporter CLI (self-contained in this repo):
+## Exporter (`cx`)
 
 ```bash
+cx <session-id> --compact
 cx <session-id> --medium
-cx <session-id> --full --out ~/coder-md
-cx <session-id> --json --out ~/coder-md
+cx <session-id> --full
+cx <session-id> --json
 ```
 
 Export modes:
 
 - `compact`: user + assistant messages only
-- `medium`: readable transcript with abbreviated tool calls (planning stays checklist-style)
-- `full`: readable transcript with detailed tool call bodies
-- `json`: JSON-heavy dump for maximal fidelity
+- `medium`: concise markdown; abbreviated tool calls; planning rendered as checklist
+- `full`: detailed markdown; full shell/tool call bodies
+- `json`: JSON-heavy dump for highest fidelity/debugging
 
-Yes, you can still use raw `tmux` commands manually if you miss suffering.
+Default output directory for exports is `~/coder-md`.
 
-## Environment knobs
+## Environment Variables
 
 - `BR_RUN_CMD`: startup command sent to tmux (default: `coder`)
 - `BR_PREFIX`: branch prefix (default: `w/`)
@@ -82,10 +103,9 @@ Yes, you can still use raw `tmux` commands manually if you miss suffering.
 - `BR_EXPORT_OUT`: export directory for `Ctrl+S` (default: `~/coder-md`)
 - `BR_CODE_DIR`: code data dir for exports (default: `~/.code`)
 
-## Requirements
+## Development
 
-- Linux/macOS
-- `tmux`
-- Rust toolchain (`cargo`)
-
-That is all. No YAML labyrinth required.
+```bash
+cargo test
+cargo run --bin br
+```
