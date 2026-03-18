@@ -323,7 +323,7 @@ fn rollout_rel_candidates(rel: &str) -> Vec<String> {
 fn resolve_rollout_path(code_dir: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
-        return Some(rel_path.to_path_buf());
+        return rel_path.exists().then(|| rel_path.to_path_buf());
     }
 
     let candidates = [

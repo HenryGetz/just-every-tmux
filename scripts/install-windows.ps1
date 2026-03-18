@@ -54,6 +54,28 @@ function Add-UserPathIfMissing {
   [Environment]::SetEnvironmentVariable("Path", "$currentUserPath;$expanded", "User")
 }
 
+function Add-UserPathPrependIfMissing {
+  param([string]$Dir)
+
+  $expanded = [System.IO.Path]::GetFullPath($Dir)
+  $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if ([string]::IsNullOrWhiteSpace($currentUserPath)) {
+    [Environment]::SetEnvironmentVariable("Path", $expanded, "User")
+    return
+  }
+
+  $entries = $currentUserPath.Split(';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  $normalized = $entries | ForEach-Object {
+    try { [System.IO.Path]::GetFullPath($_) } catch { $_ }
+  }
+
+  if ($normalized -contains $expanded) {
+    return
+  }
+
+  [Environment]::SetEnvironmentVariable("Path", "$expanded;$currentUserPath", "User")
+}
+
 function Ensure-Rust {
   if (Get-Command cargo -ErrorAction SilentlyContinue) {
     return
@@ -323,6 +345,7 @@ function Write-CmdShim {
     [string]$TargetExe
   )
 
+  New-Item -ItemType Directory -Force -Path $PrefixDir | Out-Null
   $shimPath = Join-Path $PrefixDir ("{0}.cmd" -f $CommandName)
   $shim = "@echo off`r`n`"$TargetExe`" %*`r`n"
   Set-Content -Path $shimPath -Value $shim -Encoding ASCII
@@ -440,7 +463,8 @@ $srcDir = Join-Path $repoRoot "target\release"
 $targets = @("br.exe", "b.exe", "cx.exe")
 $installedPaths = @()
 $usedCmdShimFallback = $false
-$skippedReplacePaths = @()
+$shimOverridePrefix = Join-Path $HOME ".local\shim-bin"
+$usedShimOverridePath = $false
 
 foreach ($exe in $targets) {
   $src = Join-Path $srcDir $exe
@@ -508,20 +532,29 @@ foreach ($exe in $targets) {
     }
 
     if (Test-IsFileLockError -ErrorRecord $_) {
-      Write-Host "warning: $dst is in use; installing command shim fallback instead."
+      Write-Host "warning: $dst is in use; installing shim in $shimOverridePrefix to bypass locked binary."
+      if (-not (Test-Path -Path $src -PathType Leaf)) {
+        throw "Lock fallback failed: source binary missing at $src"
+      }
       $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-      $shimPath = Write-CmdShim -PrefixDir $Prefix -CommandName $cmdName -TargetExe $src
+      $shimPath = Write-CmdShim -PrefixDir $shimOverridePrefix -CommandName $cmdName -TargetExe $src
       $installedPaths += $shimPath
       $usedCmdShimFallback = $true
+      $usedShimOverridePath = $true
       continue
     }
 
     $hresultCode = [int]($_.Exception.HResult -band 0xFFFF)
     if ($hresultCode -eq 5 -and (Test-Path $dst)) {
-      Write-Host "warning: access denied while replacing $dst; keeping existing binary."
-      Write-Host "warning: close any running br/b/cx process, then rerun installer to update this binary."
-      $installedPaths += $dst
-      $skippedReplacePaths += $dst
+      Write-Host "warning: access denied while replacing $dst; installing shim in $shimOverridePrefix."
+      if (-not (Test-Path -Path $src -PathType Leaf)) {
+        throw "Access-denied fallback failed: source binary missing at $src"
+      }
+      $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+      $shimPath = Write-CmdShim -PrefixDir $shimOverridePrefix -CommandName $cmdName -TargetExe $src
+      $installedPaths += $shimPath
+      $usedCmdShimFallback = $true
+      $usedShimOverridePath = $true
       continue
     }
 
@@ -530,6 +563,9 @@ foreach ($exe in $targets) {
 }
 
 Add-UserPathIfMissing $Prefix
+if ($usedShimOverridePath) {
+  Add-UserPathPrependIfMissing $shimOverridePrefix
+}
 
 Write-Host "==> Installed"
 foreach ($p in $installedPaths) {
@@ -553,16 +589,14 @@ else {
 
 if ($usedCmdShimFallback) {
   Write-Host ""
-  Write-Host "Note: Defender blocked direct .exe copy. Installed .cmd shims that run binaries from:"
+  Write-Host "Note: installed .cmd shims for one or more commands."
   Write-Host "  $srcDir"
   Write-Host "If your org policy allows, add an exclusion for this repo or approve the binaries in Windows Security."
 }
 
-if ($skippedReplacePaths.Count -gt 0) {
+if ($usedShimOverridePath) {
   Write-Host ""
-  Write-Host "Note: some binaries could not be replaced due to access restrictions and were left as-is:"
-  foreach ($p in $skippedReplacePaths) {
-    Write-Host "  $p"
-  }
-  Write-Host "Close any running br/b/cx process and rerun installer if you need the latest binary for those commands."
+  Write-Host "Note: command shims were installed in:"
+  Write-Host "  $shimOverridePrefix"
+  Write-Host "This shim directory was prepended to your user PATH so br/b/cx resolve to latest build even if old .exe files are locked."
 }
