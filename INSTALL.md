@@ -99,6 +99,7 @@ This script:
 - auto-installs `psmux` (tmux-compatible command) if `tmux` is missing
 - uses Windows user profile paths by default (including `%USERPROFILE%\.code`)
 - uses lightweight portable MSVC via `portable-msvc.py` by default (`%USERPROFILE%\.portable-msvc`)
+- auto-installs a user-scoped Python runtime if needed for `portable-msvc.py`
 
 If you explicitly want full Visual Studio Build Tools instead:
 

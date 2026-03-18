@@ -50,6 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 
 This does a native Windows install and also auto-installs `psmux` (tmux-compatible) when needed.
 It uses the current Windows user profile paths by default (including `%USERPROFILE%\.code` for coder sessions).
+If Python is missing, the installer auto-installs a user-scoped Python runtime for `portable-msvc.py`.
 
 By default, the installer uses a lightweight portable MSVC toolchain via `portable-msvc.py`.
 No Visual Studio Installer is required for the default path.

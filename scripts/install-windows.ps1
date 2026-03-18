@@ -81,11 +81,45 @@ function Ensure-Rust {
 }
 
 function Ensure-PythonCommand {
-  if (Get-Command py -ErrorAction SilentlyContinue) {
-    return @{ exe = "py"; args = @("-3") }
+  function Resolve-Python {
+    param(
+      [string]$Exe,
+      [string[]]$PrefixArgs
+    )
+
+    try {
+      $output = & $Exe @PrefixArgs -c "import sys; print(sys.executable)"
+      if ($LASTEXITCODE -ne 0) {
+        return $null
+      }
+
+      $text = ($output | Out-String).Trim()
+      if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+      }
+
+      if ($text -match "Python was not found") {
+        return $null
+      }
+
+      return @{ exe = $Exe; args = $PrefixArgs }
+    }
+    catch {
+      return $null
+    }
   }
-  if (Get-Command python -ErrorAction SilentlyContinue) {
-    return @{ exe = "python"; args = @() }
+
+  $candidates = @(
+    @{ exe = "py"; args = @("-3") },
+    @{ exe = "python"; args = @() },
+    @{ exe = "python3"; args = @() }
+  )
+
+  foreach ($candidate in $candidates) {
+    $resolved = Resolve-Python -Exe $candidate.exe -PrefixArgs $candidate.args
+    if ($null -ne $resolved) {
+      return $resolved
+    }
   }
 
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -94,14 +128,36 @@ function Ensure-PythonCommand {
 
   Write-Host "==> Installing Python 3 via winget"
   Invoke-Checked {
-    winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+    winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
   } "Install Python via winget"
 
-  if (Get-Command py -ErrorAction SilentlyContinue) {
-    return @{ exe = "py"; args = @("-3") }
+  $possiblePathAdds = @(
+    (Join-Path $HOME "AppData\\Local\\Programs\\Python\\Launcher"),
+    (Join-Path $HOME "AppData\\Local\\Programs\\Python\\Python312"),
+    (Join-Path $HOME "AppData\\Local\\Programs\\Python\\Python313"),
+    (Join-Path $HOME "AppData\\Local\\Microsoft\\WindowsApps")
+  )
+  foreach ($p in $possiblePathAdds) {
+    if (Test-Path $p) {
+      $env:Path = "$p;$env:Path"
+    }
   }
-  if (Get-Command python -ErrorAction SilentlyContinue) {
-    return @{ exe = "python"; args = @() }
+
+  foreach ($candidate in $candidates) {
+    $resolved = Resolve-Python -Exe $candidate.exe -PrefixArgs $candidate.args
+    if ($null -ne $resolved) {
+      return $resolved
+    }
+  }
+
+  $directPy = Get-ChildItem -Path (Join-Path $HOME "AppData\\Local\\Programs\\Python") -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+  if ($null -ne $directPy) {
+    $resolved = Resolve-Python -Exe $directPy.FullName -PrefixArgs @()
+    if ($null -ne $resolved) {
+      return $resolved
+    }
   }
 
   throw "Python installation completed but python launcher not found in PATH. Open a new terminal and rerun."
