@@ -338,7 +338,8 @@ function Test-IsAntivirusBlock {
   $exception = $ErrorRecord.Exception
 
   while ($null -ne $exception) {
-    $win32Code = [int](([uint32]$exception.HResult) -band 0xFFFF)
+    # HResult may be negative; use bitmasking directly to avoid invalid uint casts.
+    $win32Code = [int]($exception.HResult -band 0xFFFF)
     if ($malwareWin32Codes -contains $win32Code) {
       return $true
     }
