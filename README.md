@@ -48,7 +48,14 @@ cd just-every-tmux
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
-This installs binaries inside WSL at `~/.local/bin`.
+This does a native Windows install and also auto-installs `psmux` (tmux-compatible) when needed.
+It uses the current Windows user profile paths by default (including `%USERPROFILE%\.code` for coder sessions).
+
+If you want to skip `psmux` auto-install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -SkipPsmux
+```
 
 ## Quick Start
 

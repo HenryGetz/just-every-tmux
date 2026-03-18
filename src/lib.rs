@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Stdout};
-use std::os::unix::process::CommandExt;
+use std::io::{self, BufRead, BufReader, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use regex::Regex;
+use serde_json::Value;
 use strfmt::strfmt;
 use which::which;
 
@@ -568,6 +568,118 @@ fn session_id_from_pid_fds(pid: i32) -> Option<String> {
     None
 }
 
+fn normalize_path_for_compare(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    while normalized.ends_with('/') && normalized.len() > 1 {
+        normalized.pop();
+    }
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn paths_match(a: &str, b: &str) -> bool {
+    normalize_path_for_compare(a) == normalize_path_for_compare(b)
+}
+
+fn session_meta_cwd_from_rollout(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(obj) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        return obj
+            .get("payload")
+            .and_then(|p| p.get("cwd"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    None
+}
+
+fn session_id_from_cwd(cwd: &str) -> Option<String> {
+    let code_dir = export_code_dir();
+    let catalog_path = code_dir.join("sessions/index/catalog.jsonl");
+    let content = fs::read_to_string(catalog_path).ok()?;
+
+    for line in content.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if obj.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let Some(session_id) = obj.get("session_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rollout_rel) = obj.get("rollout_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let rollout = code_dir.join(rollout_rel);
+        let Some(meta_cwd) = session_meta_cwd_from_rollout(&rollout) else {
+            continue;
+        };
+        if paths_match(&meta_cwd, cwd) {
+            return Some(session_id.to_string());
+        }
+    }
+
+    None
+}
+
+fn session_id_from_pane_paths(name: &str) -> Option<String> {
+    let out = tmux_capture(vec![
+        "list-panes".to_string(),
+        "-t".to_string(),
+        name.to_string(),
+        "-F".to_string(),
+        "#{pane_current_path}\t#{pane_active}".to_string(),
+    ])
+    .ok()?;
+
+    if out.code != 0 {
+        return None;
+    }
+
+    let mut active = Vec::new();
+    let mut other = Vec::new();
+    let mut seen = HashSet::new();
+
+    for row in out.stdout.lines() {
+        let mut parts = row.split('\t');
+        let cwd = parts.next().unwrap_or("").trim().to_string();
+        let is_active = parts.next().unwrap_or("0") == "1";
+        if cwd.is_empty() || !seen.insert(normalize_path_for_compare(&cwd)) {
+            continue;
+        }
+        if is_active {
+            active.push(cwd);
+        } else {
+            other.push(cwd);
+        }
+    }
+
+    for cwd in active.into_iter().chain(other.into_iter()) {
+        if let Some(id) = session_id_from_cwd(&cwd) {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
 fn session_id_from_tty(tty: &str) -> Option<String> {
     let tty_short = tty.strip_prefix("/dev/").unwrap_or(tty);
     let args = vec![
@@ -632,7 +744,7 @@ fn coder_session_id_for_tmux_session(name: &str) -> Option<String> {
         }
     }
 
-    None
+    session_id_from_pane_paths(name)
 }
 
 fn export_out_path() -> PathBuf {
@@ -827,9 +939,13 @@ fn exec_attach_or_switch(name: &str) -> i32 {
         cmd.args(["attach", "-t", name]);
     }
 
-    let err = cmd.exec();
-    eprintln!("[br] failed to exec tmux: {}", err);
-    127
+    match cmd.status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("[br] failed to run tmux: {}", err);
+            127
+        }
+    }
 }
 
 fn normalize_session_name(raw: &str) -> String {
@@ -2137,8 +2253,8 @@ mod tests {
 
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score,
-        handle_filter_mode, handle_new_session_mode, normalize_session_name, App, InputMode,
-        SessionInfo,
+        handle_filter_mode, handle_new_session_mode, normalize_session_name, paths_match, App,
+        InputMode, SessionInfo,
     };
 
     fn test_app() -> App {
@@ -2313,5 +2429,15 @@ mod tests {
             extract_session_id_from_path(path).as_deref(),
             Some("5567a4cb-9214-4a08-a377-28bb71eb5b44")
         );
+    }
+
+    #[test]
+    fn path_compare_ignores_trailing_slash() {
+        assert!(paths_match("/home/wavy/project/", "/home/wavy/project"));
+    }
+
+    #[test]
+    fn path_compare_normalizes_separator() {
+        assert!(paths_match("C:/Users/test/.code", "C:\\Users\\test\\.code"));
     }
 }

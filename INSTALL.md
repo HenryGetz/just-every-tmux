@@ -82,9 +82,7 @@ b --help
 cx --help
 ```
 
-## 5) Windows (WSL2 Recommended)
-
-`tmux` support is best through WSL2.
+## 5) Windows (Native PowerShell)
 
 Fast path from PowerShell:
 
@@ -94,33 +92,26 @@ cd just-every-tmux
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
-Manual path (if you prefer to run commands yourself):
+This script:
 
-In PowerShell (Admin), install WSL + Ubuntu:
+- builds native Windows binaries (`br.exe`, `b.exe`, `cx.exe`)
+- installs them to `~\.local\bin`
+- auto-installs `psmux` (tmux-compatible command) if `tmux` is missing
+- uses Windows user profile paths by default (including `%USERPROFILE%\.code`)
+
+Verify in a new PowerShell window:
 
 ```powershell
-wsl --install -d Ubuntu
-```
-
-Reboot if prompted, then open Ubuntu and run:
-
-```bash
-sudo apt update
-sudo apt install -y tmux curl build-essential pkg-config libssl-dev git
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-git clone https://github.com/HenryGetz/just-every-tmux.git
-cd just-every-tmux
-./install
-```
-
-Verify in WSL:
-
-```bash
 br --help
 b --help
 cx --help
+tmux --help
+```
+
+If you want to skip `psmux` auto-install:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -SkipPsmux
 ```
 
 ## Upgrading
