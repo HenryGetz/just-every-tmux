@@ -98,9 +98,19 @@ This script:
 - installs them to `~\.local\bin`
 - auto-installs `psmux` (tmux-compatible command) if `tmux` is missing
 - uses Windows user profile paths by default (including `%USERPROFILE%\.code`)
+- uses lightweight portable MSVC via `portable-msvc.py` by default (`%USERPROFILE%\.portable-msvc`)
 
-If Rust build fails with `LNK1104: cannot open file 'msvcrt.lib'`, the installer now auto-attempts to install Visual Studio C++ Build Tools and retries.
-If that step is blocked by policy, run PowerShell as Admin and rerun.
+If you explicitly want full Visual Studio Build Tools instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -UseMsvcBuildTools
+```
+
+If you use the portable toolchain to build native Python extensions, you may also need:
+
+```powershell
+$env:DISTUTILS_USE_SDK = "1"
+```
 
 Verify in a new PowerShell window:
 

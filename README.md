@@ -12,7 +12,7 @@ It gives you three binaries:
 
 - Linux: fully supported
 - macOS: fully supported
-- Windows: supported through WSL2 (recommended and documented)
+- Windows: fully supported natively in PowerShell (no WSL required)
 
 For step-by-step setup instructions, use `INSTALL.md`.
 
@@ -40,7 +40,7 @@ Then restart your shell, or run:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Windows (PowerShell + WSL2)
+### Windows (Native PowerShell)
 
 ```powershell
 git clone https://github.com/HenryGetz/just-every-tmux.git
@@ -51,7 +51,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 This does a native Windows install and also auto-installs `psmux` (tmux-compatible) when needed.
 It uses the current Windows user profile paths by default (including `%USERPROFILE%\.code` for coder sessions).
 
-If your machine is missing MSVC build libraries (for example `msvcrt.lib` linker errors), the installer auto-attempts to install Visual Studio C++ Build Tools and retries.
+By default, the installer uses a lightweight portable MSVC toolchain via `portable-msvc.py`.
+No Visual Studio Installer is required for the default path.
+
+If you explicitly want full Visual Studio Build Tools instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -UseMsvcBuildTools
+```
 
 If you want to skip `psmux` auto-install:
 
