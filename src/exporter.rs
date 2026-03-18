@@ -246,35 +246,182 @@ fn resolve_output_path(session_id: &str, out_path: &Path) -> Result<PathBuf, Str
 }
 
 fn rollout_path_for_session(session_id: &str, code_dir: &Path) -> Result<PathBuf, String> {
-    let catalog = code_dir.join("sessions/index/catalog.jsonl");
-    let file = File::open(&catalog).map_err(|e| format!("Catalog not found: {} ({})", catalog.display(), e))?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => continue,
-        };
-        let obj: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let sid = obj.get("session_id").and_then(Value::as_str).unwrap_or("");
-        if sid != session_id {
-            continue;
-        }
-        let deleted = obj.get("deleted").and_then(Value::as_bool).unwrap_or(false);
-        if deleted {
-            return Err(format!("Session {} is marked deleted in catalog", session_id));
-        }
-        let rel = obj
-            .get("rollout_path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("Session {} missing rollout_path in catalog", session_id))?;
-        return Ok(code_dir.join(rel));
+    if let Some(path) = rollout_path_from_catalog(session_id, code_dir)? {
+        return Ok(path);
     }
 
-    Err(format!("Session not found in catalog: {}", session_id))
+    if let Some(path) = rollout_path_from_scan(session_id, code_dir) {
+        return Ok(path);
+    }
+
+    Err(format!(
+        "Session not found: {} (searched catalog and rollout files under {})",
+        session_id,
+        code_dir.display()
+    ))
+}
+
+fn rollout_path_from_catalog(session_id: &str, code_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let catalog_candidates = [
+        code_dir.join("sessions/index/catalog.jsonl"),
+        code_dir.join("index/catalog.jsonl"),
+        code_dir.join("catalog.jsonl"),
+    ];
+
+    for catalog in catalog_candidates {
+        let Ok(file) = File::open(&catalog) else {
+            continue;
+        };
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => continue,
+            };
+            let obj: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let sid = obj.get("session_id").and_then(Value::as_str).unwrap_or("");
+            if sid != session_id {
+                continue;
+            }
+            let deleted = obj.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+            if deleted {
+                return Err(format!("Session {} is marked deleted in catalog", session_id));
+            }
+            let rel = obj
+                .get("rollout_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("Session {} missing rollout_path in catalog", session_id))?;
+
+            if let Some(path) = resolve_rollout_path(code_dir, rel) {
+                return Ok(Some(path));
+            }
+            return Ok(Some(code_dir.join(rel)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_rollout_path(code_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Some(rel_path.to_path_buf());
+    }
+
+    let candidates = [
+        code_dir.join(rel_path),
+        code_dir
+            .parent()
+            .map(|p| p.join(rel_path))
+            .unwrap_or_else(|| code_dir.join(rel_path)),
+        code_dir.join("sessions").join(rel_path),
+    ];
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn rollout_path_from_scan(session_id: &str, code_dir: &Path) -> Option<PathBuf> {
+    let sid = session_id.to_ascii_lowercase();
+    let mut matches = Vec::new();
+
+    for root in rollout_search_roots(code_dir) {
+        collect_rollout_matches(&root, &sid, &mut matches);
+    }
+
+    matches.sort_by(|a, b| rollout_sort_key(b).cmp(&rollout_sort_key(a)));
+    matches.into_iter().next()
+}
+
+fn rollout_search_roots(code_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    let sessions_child = code_dir.join("sessions");
+    if sessions_child.is_dir() {
+        roots.push(sessions_child);
+    }
+
+    if code_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("sessions"))
+    {
+        roots.push(code_dir.to_path_buf());
+    }
+
+    if code_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("index"))
+    {
+        if let Some(parent) = code_dir.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+
+    if roots.is_empty() {
+        roots.push(code_dir.to_path_buf());
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let key = root.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(root);
+        }
+    }
+    deduped
+}
+
+fn collect_rollout_matches(dir: &Path, session_id_lc: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        if ft.is_dir() {
+            collect_rollout_matches(&path, session_id_lc, out);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        let name_lc = name.to_ascii_lowercase();
+        if !name_lc.contains(session_id_lc) {
+            continue;
+        }
+
+        out.push(path);
+    }
+}
+
+fn rollout_sort_key(path: &Path) -> (u128, String) {
+    let modified = path
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| u128::MAX.saturating_sub(age.as_nanos()))
+        .unwrap_or(0);
+
+    (modified, path.to_string_lossy().to_string())
 }
 
 fn first_session_meta(rollout: &Path) -> Result<Option<Value>, String> {
@@ -1534,5 +1681,93 @@ mod tests {
     fn scrub_noise_lines_removes_json_style_encrypted_content_with_spacing() {
         let text = "{\"type\":\"reasoning\", \"encrypted_content\" : \"abc\"}";
         assert_eq!(scrub_noise_lines(text), "");
+    }
+
+    #[test]
+    fn export_falls_back_to_rollout_scan_when_catalog_missing() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-scan-{}", uniq));
+        let code_dir = root.join(".code");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let rollout_path = rollout_dir.join(format!(
+            "rollout-2026-03-18T12-00-00-{}.jsonl",
+            session_id
+        ));
+
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "C:/Users/bmthub"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello from scan fallback"}]
+            }
+        });
+        fs::write(&rollout_path, format!("{}\n{}\n", session_meta, assistant)).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+        assert!(body.contains("hello from scan fallback"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_accepts_sessions_dir_as_code_dir() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-sessions-root-{}", uniq));
+        let code_dir = root.join(".code");
+        let sessions_dir = code_dir.join("sessions");
+        let rollout_dir = sessions_dir.join("2026/03/18");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let rollout_path = rollout_dir.join(format!(
+            "rollout-2026-03-18T12-00-00-{}.jsonl",
+            session_id
+        ));
+
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "C:/Users/bmthub"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello from sessions dir"}]
+            }
+        });
+        fs::write(&rollout_path, format!("{}\n{}\n", session_meta, assistant)).expect("rollout write");
+
+        let out_file = export_session_markdown(
+            session_id,
+            &root.join("out"),
+            ExportMode::Medium,
+            &sessions_dir,
+        )
+        .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+        assert!(body.contains("hello from sessions dir"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

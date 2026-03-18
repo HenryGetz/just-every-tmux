@@ -47,8 +47,33 @@ fn home_dir_string() -> Option<String> {
 
 fn usage() {
     eprintln!(
-        "cx (rust)\n\nUsage:\n  cx <session-id> [--out <dir|file.md>] [--code-dir <dir>] [--compact|--medium|--full|--json]\n\nDefaults:\n  --out ~/coder-md\n  --code-dir ~/.code\n  --compact\n"
+        "cx (rust)\n\nUsage:\n  cx <session-id> [--out <dir|file.md>] [--code-dir <dir>] [--compact|--medium|--full|--json]\n\nDefaults:\n  --out ~/coder-md\n  --code-dir ~/.code (falls back to ~/.codex)\n  --compact\n"
     );
+}
+
+fn default_code_dir() -> PathBuf {
+    if let Ok(v) = env::var("CX_CODE_DIR") {
+        if !v.trim().is_empty() {
+            return expand_path(&v);
+        }
+    }
+    if let Ok(v) = env::var("BR_CODE_DIR") {
+        if !v.trim().is_empty() {
+            return expand_path(&v);
+        }
+    }
+
+    let code = expand_path("~/.code");
+    if code.exists() {
+        return code;
+    }
+
+    let codex = expand_path("~/.codex");
+    if codex.exists() {
+        return codex;
+    }
+
+    code
 }
 
 fn main() {
@@ -56,7 +81,7 @@ fn main() {
 
     let mut session_id: Option<String> = None;
     let mut out_path = expand_path("~/coder-md");
-    let mut code_dir = expand_path("~/.code");
+    let mut code_dir = default_code_dir();
     let mut mode = ExportMode::Compact;
 
     while let Some(arg) = args.next() {

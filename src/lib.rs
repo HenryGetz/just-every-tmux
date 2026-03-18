@@ -644,7 +644,7 @@ fn session_meta_cwd_from_rollout(path: &Path) -> Option<String> {
 fn session_ids_from_cwd_in(cwd: &str, code_dir: &Path) -> Vec<String> {
     let catalog_path = code_dir.join("sessions/index/catalog.jsonl");
     let Ok(content) = fs::read_to_string(catalog_path) else {
-        return Vec::new();
+        return session_ids_from_cwd_scan_rollouts(cwd, code_dir);
     };
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -671,6 +671,114 @@ fn session_ids_from_cwd_in(cwd: &str, code_dir: &Path) -> Vec<String> {
         };
         if paths_match(&meta_cwd, cwd) && seen.insert(session_id.to_string()) {
             out.push(session_id.to_string());
+        }
+    }
+
+    if out.is_empty() {
+        return session_ids_from_cwd_scan_rollouts(cwd, code_dir);
+    }
+
+    out
+}
+
+fn rollout_search_roots(code_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    let sessions_child = code_dir.join("sessions");
+    if sessions_child.is_dir() {
+        roots.push(sessions_child);
+    }
+
+    if code_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("sessions"))
+    {
+        roots.push(code_dir.to_path_buf());
+    }
+
+    if code_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("index"))
+    {
+        if let Some(parent) = code_dir.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+
+    if roots.is_empty() {
+        roots.push(code_dir.to_path_buf());
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let key = normalize_path_for_compare(&root.to_string_lossy());
+        if seen.insert(key) {
+            deduped.push(root);
+        }
+    }
+    deduped
+}
+
+fn collect_rollout_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        if ft.is_dir() {
+            collect_rollout_paths(&path, out);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        out.push(path);
+    }
+}
+
+fn session_ids_from_cwd_scan_rollouts(cwd: &str, code_dir: &Path) -> Vec<String> {
+    let mut rollouts = Vec::new();
+    for root in rollout_search_roots(code_dir) {
+        collect_rollout_paths(&root, &mut rollouts);
+    }
+
+    rollouts.sort_by(|a, b| b.cmp(a));
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for rollout in rollouts {
+        let Some(meta_cwd) = session_meta_cwd_from_rollout(&rollout) else {
+            continue;
+        };
+        if !paths_match(&meta_cwd, cwd) {
+            continue;
+        }
+
+        let Some(path_str) = rollout.to_str() else {
+            continue;
+        };
+        let Some(session_id) = extract_session_id_from_path(path_str) else {
+            continue;
+        };
+        if seen.insert(session_id.clone()) {
+            out.push(session_id);
         }
     }
 
@@ -806,7 +914,18 @@ fn export_code_dir() -> PathBuf {
             return expand_path(&v);
         }
     }
-    expand_path("~/.code")
+
+    let code = expand_path("~/.code");
+    if code.exists() {
+        return code;
+    }
+
+    let codex = expand_path("~/.codex");
+    if codex.exists() {
+        return codex;
+    }
+
+    code
 }
 
 fn start_export_prompt(app: &mut App) {
@@ -2591,6 +2710,31 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&sid_a.to_string()));
         assert!(matches.contains(&sid_b.to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_ids_from_cwd_scans_rollouts_when_catalog_missing() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-cwd-scan-fallback-{}", uniq));
+        let code_dir = root.join(".code");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let sid = "dddddddd-eeee-ffff-1111-222222222222";
+        let rollout = rollout_dir.join(format!("rollout-2026-03-18T12-00-00-{}.jsonl", sid));
+        fs::write(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"C:/Users/test/project\"}}\n",
+        )
+        .expect("rollout write");
+
+        let matches = session_ids_from_cwd_in("C:\\Users\\test\\project", &code_dir);
+        assert_eq!(matches, vec![sid.to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
