@@ -440,6 +440,7 @@ $srcDir = Join-Path $repoRoot "target\release"
 $targets = @("br.exe", "b.exe", "cx.exe")
 $installedPaths = @()
 $usedCmdShimFallback = $false
+$skippedReplacePaths = @()
 
 foreach ($exe in $targets) {
   $src = Join-Path $srcDir $exe
@@ -515,6 +516,15 @@ foreach ($exe in $targets) {
       continue
     }
 
+    $hresultCode = [int]($_.Exception.HResult -band 0xFFFF)
+    if ($hresultCode -eq 5 -and (Test-Path $dst)) {
+      Write-Host "warning: access denied while replacing $dst; keeping existing binary."
+      Write-Host "warning: close any running br/b/cx process, then rerun installer to update this binary."
+      $installedPaths += $dst
+      $skippedReplacePaths += $dst
+      continue
+    }
+
     throw
   }
 }
@@ -546,4 +556,13 @@ if ($usedCmdShimFallback) {
   Write-Host "Note: Defender blocked direct .exe copy. Installed .cmd shims that run binaries from:"
   Write-Host "  $srcDir"
   Write-Host "If your org policy allows, add an exclusion for this repo or approve the binaries in Windows Security."
+}
+
+if ($skippedReplacePaths.Count -gt 0) {
+  Write-Host ""
+  Write-Host "Note: some binaries could not be replaced due to access restrictions and were left as-is:"
+  foreach ($p in $skippedReplacePaths) {
+    Write-Host "  $p"
+  }
+  Write-Host "Close any running br/b/cx process and rerun installer if you need the latest binary for those commands."
 }
