@@ -65,15 +65,24 @@ function Add-UserPathPrependIfMissing {
   }
 
   $entries = $currentUserPath.Split(';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-  $normalized = $entries | ForEach-Object {
-    try { [System.IO.Path]::GetFullPath($_) } catch { $_ }
+  $filtered = @()
+
+  foreach ($entry in $entries) {
+    $normalized = try { [System.IO.Path]::GetFullPath($entry) } catch { $entry }
+    if ($normalized -ieq $expanded) {
+      continue
+    }
+    $filtered += $entry
   }
 
-  if ($normalized -contains $expanded) {
-    return
+  $newPath = if ($filtered.Count -gt 0) {
+    "$expanded;" + ($filtered -join ';')
+  }
+  else {
+    $expanded
   }
 
-  [Environment]::SetEnvironmentVariable("Path", "$expanded;$currentUserPath", "User")
+  [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
 }
 
 function Ensure-Rust {
