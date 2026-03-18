@@ -466,10 +466,19 @@ foreach ($exe in $targets) {
 
     # Copy to a temporary file first so locked destination binaries do not block updates.
     Copy-Item -Force $src $tmpDst -ErrorAction Stop
+
+    if (Test-Path $dst) {
+      Remove-Item -Force $dst -ErrorAction Stop
+    }
+
     Move-Item -Force $tmpDst $dst -ErrorAction Stop
     $installedPaths += $dst
   }
   catch {
+    if (Test-Path $tmpDst) {
+      Remove-Item -Force $tmpDst -ErrorAction SilentlyContinue
+    }
+
     if (Test-IsAntivirusBlock -ErrorRecord $_) {
       Write-Host "warning: Defender blocked copying $exe to $Prefix; installing command shim instead."
 
