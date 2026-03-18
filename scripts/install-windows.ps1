@@ -225,7 +225,8 @@ function Invoke-PythonScript {
     [string[]]$Arguments
   )
 
-  & $Python.exe @($Python.args) $ScriptPath @Arguments
+  # Stream script logs to console but do not leak them into function return values.
+  & $Python.exe @($Python.args) $ScriptPath @Arguments 2>&1 | Out-Host
   if ($LASTEXITCODE -ne 0) {
     throw "portable-msvc.py failed (exit code $LASTEXITCODE)."
   }
@@ -237,7 +238,7 @@ function Ensure-PortableMsvcToolchain {
   $setupBat = Join-Path $msvcDir "setup_x64.bat"
 
   if (Test-Path $setupBat) {
-    return $setupBat
+    return [string]$setupBat
   }
 
   $python = Ensure-PythonCommand
@@ -268,7 +269,7 @@ function Ensure-PortableMsvcToolchain {
     throw "portable MSVC setup script not found at $setupBat"
   }
 
-  return $setupBat
+  return [string]$setupBat
 }
 
 function Import-BatchEnvironment {
