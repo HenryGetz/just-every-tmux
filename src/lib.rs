@@ -606,10 +606,13 @@ fn session_meta_cwd_from_rollout(path: &Path) -> Option<String> {
     None
 }
 
-fn session_id_from_cwd(cwd: &str) -> Option<String> {
-    let code_dir = export_code_dir();
+fn session_ids_from_cwd_in(cwd: &str, code_dir: &Path) -> Vec<String> {
     let catalog_path = code_dir.join("sessions/index/catalog.jsonl");
-    let content = fs::read_to_string(catalog_path).ok()?;
+    let Ok(content) = fs::read_to_string(catalog_path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
 
     for line in content.lines().rev() {
         if line.trim().is_empty() {
@@ -631,12 +634,12 @@ fn session_id_from_cwd(cwd: &str) -> Option<String> {
         let Some(meta_cwd) = session_meta_cwd_from_rollout(&rollout) else {
             continue;
         };
-        if paths_match(&meta_cwd, cwd) {
-            return Some(session_id.to_string());
+        if paths_match(&meta_cwd, cwd) && seen.insert(session_id.to_string()) {
+            out.push(session_id.to_string());
         }
     }
 
-    None
+    out
 }
 
 fn session_id_from_pane_paths(name: &str) -> Option<String> {
@@ -652,6 +655,8 @@ fn session_id_from_pane_paths(name: &str) -> Option<String> {
     if out.code != 0 {
         return None;
     }
+
+    let code_dir = export_code_dir();
 
     let mut active = Vec::new();
     let mut other = Vec::new();
@@ -672,8 +677,9 @@ fn session_id_from_pane_paths(name: &str) -> Option<String> {
     }
 
     for cwd in active.into_iter().chain(other.into_iter()) {
-        if let Some(id) = session_id_from_cwd(&cwd) {
-            return Some(id);
+        let matches = session_ids_from_cwd_in(&cwd, &code_dir);
+        if matches.len() == 1 {
+            return matches.first().cloned();
         }
     }
 
@@ -2279,12 +2285,15 @@ fn tui(_mode: Mode) -> BrResult<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score,
         handle_filter_mode, handle_new_session_mode, normalize_session_name, paths_match, App,
-        InputMode, SessionInfo,
+        InputMode, SessionInfo, session_ids_from_cwd_in,
     };
 
     fn test_app() -> App {
@@ -2469,5 +2478,84 @@ mod tests {
     #[test]
     fn path_compare_normalizes_separator() {
         assert!(paths_match("C:/Users/test/.code", "C:\\Users\\test\\.code"));
+    }
+
+    #[test]
+    fn session_ids_from_cwd_returns_unique_match_only() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-cwd-unique-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let rollout_rel = format!("sessions/2026/03/07/rollout-{}.jsonl", sid);
+        let rollout_path = code_dir.join(&rollout_rel);
+        fs::write(
+            &rollout_path,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"C:/Users/test/project\"}}\n",
+        )
+        .expect("rollout write");
+        fs::write(
+            catalog_dir.join("catalog.jsonl"),
+            format!(
+                "{{\"session_id\":\"{}\",\"rollout_path\":\"{}\",\"deleted\":false}}\n",
+                sid, rollout_rel
+            ),
+        )
+        .expect("catalog write");
+
+        let matches = session_ids_from_cwd_in("C:\\Users\\test\\project", &code_dir);
+        assert_eq!(matches, vec![sid.to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_ids_from_cwd_disambiguates_shared_cwd() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-cwd-ambiguous-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let sid_a = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let sid_b = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let rel_a = format!("sessions/2026/03/07/rollout-{}.jsonl", sid_a);
+        let rel_b = format!("sessions/2026/03/07/rollout-{}.jsonl", sid_b);
+
+        fs::write(
+            code_dir.join(&rel_a),
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/shared/repo\"}}\n",
+        )
+        .expect("rollout a");
+        fs::write(
+            code_dir.join(&rel_b),
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/shared/repo\"}}\n",
+        )
+        .expect("rollout b");
+
+        let catalog = format!(
+            "{{\"session_id\":\"{}\",\"rollout_path\":\"{}\",\"deleted\":false}}\n{{\"session_id\":\"{}\",\"rollout_path\":\"{}\",\"deleted\":false}}\n",
+            sid_a, rel_a, sid_b, rel_b
+        );
+        fs::write(catalog_dir.join("catalog.jsonl"), catalog).expect("catalog write");
+
+        let matches = session_ids_from_cwd_in("/shared/repo", &code_dir);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&sid_a.to_string()));
+        assert!(matches.contains(&sid_b.to_string()));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

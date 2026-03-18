@@ -107,6 +107,15 @@ pub fn export_session_markdown(
                             capture_medium_tool_call(payload, 140, detailed_calls, ts)
                         {
                             pending_medium_calls.insert(call_id, call);
+                        } else if let Some(rendered) =
+                            render_unpaired_tool_call(ts, payload, 140, detailed_calls)
+                        {
+                            if last_written_block.as_deref() == Some(rendered.as_str()) {
+                                continue;
+                            }
+                            out.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+                            last_written_block = Some(rendered);
+                            last_medium_reasoning_key = None;
                         }
                         continue;
                     }
@@ -427,6 +436,28 @@ fn render_pending_tool_call(call: &MediumToolCall) -> String {
         &format!("TOOL `{}`", inline_code(&call.name)),
         &call.call_markdown,
     )
+}
+
+fn render_unpaired_tool_call(
+    ts: &str,
+    payload: Option<&Value>,
+    max_len: usize,
+    detailed_calls: bool,
+) -> Option<String> {
+    let payload = payload?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("unknown");
+    let args = parse_json_maybe(payload.get("arguments"));
+    let call_markdown = summarize_tool_call(name, &args, max_len, detailed_calls);
+
+    Some(markdown_section(
+        ts,
+        &format!("TOOL `{}`", inline_code(name)),
+        &call_markdown,
+    ))
 }
 
 fn summarize_tool_call(name: &str, args: &Value, max_len: usize, detailed_calls: bool) -> String {
@@ -960,10 +991,12 @@ fn scrub_noise_lines(text: &str) -> String {
 fn is_noise_line(line: &str) -> bool {
     let trimmed = line.trim();
 
-    if (trimmed.contains("\"encrypted_content\"") && trimmed.contains("\":"))
-        || (trimmed.contains("\\\"encrypted_content\\\"") && trimmed.contains("\\\":"))
-    {
-        return true;
+    let normalized_quotes = trimmed.replace("\\\"", "\"");
+    if let Some(idx) = normalized_quotes.find("\"encrypted_content\"") {
+        let after = &normalized_quotes[idx + "\"encrypted_content\"".len()..];
+        if after.trim_start().starts_with(':') {
+            return true;
+        }
     }
 
     let Some((key, value)) = trimmed.split_once('=') else {
@@ -1319,6 +1352,56 @@ mod tests {
     }
 
     #[test]
+    fn medium_preserves_tool_call_without_call_id() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-no-call-id-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/07");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "11111111-1111-1111-1111-111111111114";
+        let rollout_rel = format!(
+            "sessions/2026/03/07/rollout-2026-03-07T15-00-00-{}.jsonl",
+            session_id
+        );
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let function_call = serde_json::json!({
+            "timestamp": "2026-03-07T15:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": "{\"command\":[\"bash\",\"-lc\",\"echo missing-call-id\"]}"
+            }
+        });
+
+        fs::write(&rollout_path, format!("{}\n", function_call)).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+
+        assert!(body.contains("TOOL `shell`"));
+        assert!(body.contains("missing-call-id"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn medium_dedupes_consecutive_reasoning_with_different_metadata() {
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1444,6 +1527,12 @@ mod tests {
     #[test]
     fn scrub_noise_lines_removes_json_style_encrypted_content() {
         let text = "{\"type\":\"reasoning\",\"encrypted_content\":\"abc\"}";
+        assert_eq!(scrub_noise_lines(text), "");
+    }
+
+    #[test]
+    fn scrub_noise_lines_removes_json_style_encrypted_content_with_spacing() {
+        let text = "{\"type\":\"reasoning\", \"encrypted_content\" : \"abc\"}";
         assert_eq!(scrub_noise_lines(text), "");
     }
 }
