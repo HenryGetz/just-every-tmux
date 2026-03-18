@@ -363,6 +363,36 @@ function Test-IsAntivirusBlock {
   return $false
 }
 
+function Test-IsFileLockError {
+  param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+  $exception = $ErrorRecord.Exception
+  while ($null -ne $exception) {
+    $win32Code = [int]($exception.HResult -band 0xFFFF)
+    # 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION
+    if ($win32Code -eq 32 -or $win32Code -eq 33) {
+      return $true
+    }
+
+    $nativeCodeProp = $exception.PSObject.Properties["NativeErrorCode"]
+    if ($null -ne $nativeCodeProp) {
+      $nativeCode = 0
+      if ([int]::TryParse([string]$nativeCodeProp.Value, [ref]$nativeCode) -and ($nativeCode -eq 32 -or $nativeCode -eq 33)) {
+        return $true
+      }
+    }
+
+    $exception = $exception.InnerException
+  }
+
+  $msg = $ErrorRecord.Exception.Message
+  if ($msg -match "being used by another process" -or $msg -match "cannot access the file") {
+    return $true
+  }
+
+  return $false
+}
+
 Ensure-Command git "git is required. Install Git for Windows and rerun."
 Ensure-Rust
 
@@ -429,7 +459,14 @@ foreach ($exe in $targets) {
       continue
     }
 
-    Copy-Item -Force $src $dst -ErrorAction Stop
+    $tmpDst = "$dst.new"
+    if (Test-Path $tmpDst) {
+      Remove-Item -Force $tmpDst -ErrorAction SilentlyContinue
+    }
+
+    # Copy to a temporary file first so locked destination binaries do not block updates.
+    Copy-Item -Force $src $tmpDst -ErrorAction Stop
+    Move-Item -Force $tmpDst $dst -ErrorAction Stop
     $installedPaths += $dst
   }
   catch {
@@ -453,6 +490,15 @@ foreach ($exe in $targets) {
         throw "Defender fallback failed: source binary was removed at $src (likely quarantined). Rebuild or restore the binary and rerun."
       }
 
+      $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+      $shimPath = Write-CmdShim -PrefixDir $Prefix -CommandName $cmdName -TargetExe $src
+      $installedPaths += $shimPath
+      $usedCmdShimFallback = $true
+      continue
+    }
+
+    if (Test-IsFileLockError -ErrorRecord $_) {
+      Write-Host "warning: $dst is in use; installing command shim fallback instead."
       $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
       $shimPath = Write-CmdShim -PrefixDir $Prefix -CommandName $cmdName -TargetExe $src
       $installedPaths += $shimPath
