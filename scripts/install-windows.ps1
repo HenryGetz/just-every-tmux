@@ -329,6 +329,39 @@ function Write-CmdShim {
   return $shimPath
 }
 
+function Test-IsAntivirusBlock {
+  param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+  # Locale-agnostic Win32 codes:
+  # 225 = ERROR_VIRUS_INFECTED, 226 = ERROR_VIRUS_DELETED
+  $malwareWin32Codes = @(225, 226)
+  $exception = $ErrorRecord.Exception
+
+  while ($null -ne $exception) {
+    $win32Code = [int](([uint32]$exception.HResult) -band 0xFFFF)
+    if ($malwareWin32Codes -contains $win32Code) {
+      return $true
+    }
+
+    $nativeCodeProp = $exception.PSObject.Properties["NativeErrorCode"]
+    if ($null -ne $nativeCodeProp) {
+      $nativeCode = 0
+      if ([int]::TryParse([string]$nativeCodeProp.Value, [ref]$nativeCode) -and ($malwareWin32Codes -contains $nativeCode)) {
+        return $true
+      }
+    }
+
+    $exception = $exception.InnerException
+  }
+
+  $msg = $ErrorRecord.Exception.Message
+  if ($msg -match "virus" -or $msg -match "potentially unwanted software") {
+    return $true
+  }
+
+  return $false
+}
+
 Ensure-Command git "git is required. Install Git for Windows and rerun."
 Ensure-Rust
 
@@ -399,15 +432,24 @@ foreach ($exe in $targets) {
     $installedPaths += $dst
   }
   catch {
-    $msg = $_.Exception.Message
-    if ($msg -match "virus" -or $msg -match "potentially unwanted software") {
+    if (Test-IsAntivirusBlock -ErrorRecord $_) {
       Write-Host "warning: Defender blocked copying $exe to $Prefix; installing command shim instead."
-      try {
+
+      if (Test-Path $dst) {
+        try {
+          Remove-Item -Force $dst -ErrorAction Stop
+        }
+        catch {
+          throw "Defender fallback failed: could not remove existing executable at $dst. Without removing .exe, Windows may ignore the .cmd shim. Resolve the file lock/policy issue and rerun."
+        }
+
         if (Test-Path $dst) {
-          Remove-Item -Force $dst -ErrorAction SilentlyContinue
+          throw "Defender fallback failed: existing executable still present at $dst after delete attempt. Without removing .exe, Windows may ignore the .cmd shim. Resolve the file lock/policy issue and rerun."
         }
       }
-      catch {
+
+      if (-not (Test-Path -Path $src -PathType Leaf)) {
+        throw "Defender fallback failed: source binary was removed at $src (likely quarantined). Rebuild or restore the binary and rerun."
       }
 
       $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
