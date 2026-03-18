@@ -80,6 +80,49 @@ function Ensure-Rust {
   Ensure-Command cargo "cargo still not found after rustup install. Open a new terminal and rerun."
 }
 
+function Ensure-EmbeddedPython {
+  $root = [System.IO.Path]::GetFullPath($PortableMsvcRoot)
+  $embedDir = Join-Path $root "python-embed"
+  $pythonExe = Join-Path $embedDir "python.exe"
+  if (Test-Path $pythonExe) {
+    return $pythonExe
+  }
+
+  New-Item -ItemType Directory -Force -Path $embedDir | Out-Null
+  $tmpZip = Join-Path $root "python-embed.zip"
+
+  $versions = @("3.12.10", "3.12.9", "3.12.8")
+  $downloaded = $false
+  foreach ($version in $versions) {
+    $url = "https://www.python.org/ftp/python/$version/python-$version-embed-amd64.zip"
+    try {
+      Write-Host "==> Downloading embedded Python $version"
+      Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmpZip
+      $downloaded = $true
+      break
+    }
+    catch {
+      Write-Host "warning: failed to download $url"
+    }
+  }
+
+  if (-not $downloaded) {
+    throw "Could not download embedded Python runtime from python.org."
+  }
+
+  if (Test-Path $embedDir) {
+    Get-ChildItem -Path $embedDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Expand-Archive -Path $tmpZip -DestinationPath $embedDir -Force
+  Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+
+  if (-not (Test-Path $pythonExe)) {
+    throw "Embedded Python extraction completed but python.exe was not found at $pythonExe"
+  }
+
+  return $pythonExe
+}
+
 function Ensure-PythonCommand {
   function Resolve-Python {
     param(
@@ -122,14 +165,20 @@ function Ensure-PythonCommand {
     }
   }
 
-  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    throw "Python is required for portable-msvc bootstrap and winget is unavailable. Install Python 3 and rerun."
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Write-Host "==> Installing Python 3 via winget"
+    try {
+      Invoke-Checked {
+        winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+      } "Install Python via winget"
+    }
+    catch {
+      Write-Host "warning: winget Python install failed; falling back to embedded Python runtime."
+    }
   }
-
-  Write-Host "==> Installing Python 3 via winget"
-  Invoke-Checked {
-    winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
-  } "Install Python via winget"
+  else {
+    Write-Host "==> winget not available; falling back to embedded Python runtime"
+  }
 
   $possiblePathAdds = @(
     (Join-Path $HOME "AppData\\Local\\Programs\\Python\\Launcher"),
@@ -160,7 +209,13 @@ function Ensure-PythonCommand {
     }
   }
 
-  throw "Python installation completed but python launcher not found in PATH. Open a new terminal and rerun."
+  $embeddedPython = Ensure-EmbeddedPython
+  $embeddedResolved = Resolve-Python -Exe $embeddedPython -PrefixArgs @()
+  if ($null -ne $embeddedResolved) {
+    return $embeddedResolved
+  }
+
+  throw "Python bootstrap failed. Could not find a runnable Python interpreter."
 }
 
 function Invoke-PythonScript {
