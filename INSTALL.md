@@ -99,6 +99,9 @@ This script:
 - auto-installs `psmux` (tmux-compatible command) if `tmux` is missing
 - uses Windows user profile paths by default (including `%USERPROFILE%\.code`)
 
+If Rust build fails with `LNK1104: cannot open file 'msvcrt.lib'`, the installer now auto-attempts to install Visual Studio C++ Build Tools and retries.
+If that step is blocked by policy, run PowerShell as Admin and rerun.
+
 Verify in a new PowerShell window:
 
 ```powershell

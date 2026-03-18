@@ -51,6 +51,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 This does a native Windows install and also auto-installs `psmux` (tmux-compatible) when needed.
 It uses the current Windows user profile paths by default (including `%USERPROFILE%\.code` for coder sessions).
 
+If your machine is missing MSVC build libraries (for example `msvcrt.lib` linker errors), the installer auto-attempts to install Visual Studio C++ Build Tools and retries.
+
 If you want to skip `psmux` auto-install:
 
 ```powershell

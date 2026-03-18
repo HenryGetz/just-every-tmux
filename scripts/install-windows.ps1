@@ -5,6 +5,18 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
+
+function Invoke-Checked {
+  param(
+    [scriptblock]$Command,
+    [string]$Description
+  )
+  & $Command
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Description failed (exit code $LASTEXITCODE)."
+  }
+}
 
 function Ensure-Command {
   param(
@@ -38,6 +50,49 @@ function Add-UserPathIfMissing {
   [Environment]::SetEnvironmentVariable("Path", "$currentUserPath;$expanded", "User")
 }
 
+function Install-MsvcBuildTools {
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    throw "MSVC toolchain appears incomplete and winget is unavailable. Install Visual Studio Build Tools (C++ workload) manually and rerun."
+  }
+
+  Write-Host "==> Installing Visual Studio C++ Build Tools + Windows SDK"
+  $override = "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+  winget install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-package-agreements --accept-source-agreements --override $override
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install Visual Studio Build Tools automatically. Please install it manually and rerun."
+  }
+}
+
+function Build-ReleaseWithAutoFix {
+  Write-Host "==> Building release binaries"
+  $buildLog = New-TemporaryFile
+  try {
+    & cargo build --release 2>&1 | Tee-Object -FilePath $buildLog | Out-Host
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0) {
+      return
+    }
+
+    $text = Get-Content $buildLog -Raw
+    $missingMsvc = ($text -match "LNK1104") -and ($text -match "msvcrt\.lib")
+    if ($missingMsvc) {
+      Write-Host "==> Detected missing MSVC runtime libs (msvcrt.lib). Attempting automatic fix..."
+      Install-MsvcBuildTools
+      if (Get-Command rustup -ErrorAction SilentlyContinue) {
+        Invoke-Checked { rustup default stable-x86_64-pc-windows-msvc } "rustup default msvc"
+      }
+      Write-Host "==> Retrying cargo build"
+      Invoke-Checked { cargo build --release } "cargo build"
+      return
+    }
+
+    throw "cargo build failed. See output above for details."
+  }
+  finally {
+    Remove-Item -Force $buildLog -ErrorAction SilentlyContinue
+  }
+}
+
 if ($InstallRust) {
   if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -45,7 +100,9 @@ if ($InstallRust) {
     }
 
     Write-Host "==> Installing Rust (rustup) via winget"
-    winget install -e --id Rustlang.Rustup --accept-package-agreements --accept-source-agreements
+    Invoke-Checked {
+      winget install -e --id Rustlang.Rustup --accept-package-agreements --accept-source-agreements
+    } "Install Rust via winget"
 
     $cargoBin = Join-Path $HOME ".cargo\bin"
     if (Test-Path $cargoBin) {
@@ -62,10 +119,12 @@ if (-not $SkipPsmux) {
     Write-Host "==> tmux command not found. Installing psmux (Windows-native tmux alternative)."
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-      winget install -e --id marlocarlo.psmux --accept-package-agreements --accept-source-agreements
+      Invoke-Checked {
+        winget install -e --id marlocarlo.psmux --accept-package-agreements --accept-source-agreements
+      } "Install psmux via winget"
     }
     elseif (Get-Command cargo -ErrorAction SilentlyContinue) {
-      cargo install psmux
+      Invoke-Checked { cargo install psmux } "Install psmux via cargo"
     }
     else {
       throw "Could not install psmux automatically (no winget/cargo available)."
@@ -81,8 +140,7 @@ if (-not $SkipPsmux) {
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-Write-Host "==> Building release binaries"
-cargo build --release
+Build-ReleaseWithAutoFix
 
 Write-Host "==> Installing binaries to $Prefix"
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
