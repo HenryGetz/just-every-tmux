@@ -496,6 +496,48 @@ fn parse_i64(s: &str) -> i64 {
     s.trim().parse::<i64>().unwrap_or(0)
 }
 
+fn parse_tmux_session_line(line: &str) -> Option<SessionInfo> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.contains('\t') {
+        let parts: Vec<&str> = trimmed.split('\t').collect();
+        let name = parts.first().copied().unwrap_or("").trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(SessionInfo::new(
+            name.to_string(),
+            parse_i64(parts.get(1).copied().unwrap_or("")),
+            parse_i64(parts.get(2).copied().unwrap_or("")),
+            parse_i64(parts.get(3).copied().unwrap_or("")),
+        ));
+    }
+
+    // Fallback for tmux-compatible tools (like psmux) that may ignore -F and print:
+    // "<name>: 1 windows (created ...)"
+    let name = if let Some(idx) = trimmed.find(": ") {
+        let (candidate, rest_with_sep) = trimmed.split_at(idx);
+        let rest = &rest_with_sep[2..];
+        let starts_with_count = rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+        if !candidate.trim().is_empty() && starts_with_count && rest.contains(" window") {
+            candidate.trim().to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    Some(SessionInfo::new(name, 0, 0, 0))
+}
+
 fn tmux_sessions_raw() -> BrResult<Vec<SessionInfo>> {
     let tmux = tmux_path()?;
     let fmt = "#{session_name}\t#{session_last_attached}\t#{session_activity}\t#{session_created}";
@@ -507,16 +549,9 @@ fn tmux_sessions_raw() -> BrResult<Vec<SessionInfo>> {
 
     let mut sessions = Vec::new();
     for line in out.stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.is_empty() {
-            continue;
+        if let Some(parsed) = parse_tmux_session_line(line) {
+            sessions.push(parsed);
         }
-        sessions.push(SessionInfo::new(
-            parts[0].trim().to_string(),
-            parse_i64(parts.get(1).copied().unwrap_or("")),
-            parse_i64(parts.get(2).copied().unwrap_or("")),
-            parse_i64(parts.get(3).copied().unwrap_or("")),
-        ));
     }
 
     Ok(sessions)
@@ -2292,8 +2327,9 @@ mod tests {
 
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score,
-        handle_filter_mode, handle_new_session_mode, normalize_session_name, paths_match, App,
-        InputMode, SessionInfo, session_ids_from_cwd_in,
+        handle_filter_mode, handle_new_session_mode, normalize_session_name,
+        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, InputMode,
+        SessionInfo,
     };
 
     fn test_app() -> App {
@@ -2557,5 +2593,25 @@ mod tests {
         assert!(matches.contains(&sid_b.to_string()));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_tmux_session_line_prefers_formatted_fields() {
+        let line = "alpha\t10\t20\t30";
+        let parsed = parse_tmux_session_line(line).expect("parsed");
+        assert_eq!(parsed.name, "alpha");
+        assert_eq!(parsed.last_attached, 10);
+        assert_eq!(parsed.activity, 20);
+        assert_eq!(parsed.created, 30);
+    }
+
+    #[test]
+    fn parse_tmux_session_line_falls_back_for_default_output() {
+        let line = "test-thing: 1 windows (created Wed Mar 18 12:51:39 2026)";
+        let parsed = parse_tmux_session_line(line).expect("parsed");
+        assert_eq!(parsed.name, "test-thing");
+        assert_eq!(parsed.last_attached, 0);
+        assert_eq!(parsed.activity, 0);
+        assert_eq!(parsed.created, 0);
     }
 }
