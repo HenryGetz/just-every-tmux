@@ -296,14 +296,28 @@ fn rollout_path_from_catalog(session_id: &str, code_dir: &Path) -> Result<Option
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("Session {} missing rollout_path in catalog", session_id))?;
 
-            if let Some(path) = resolve_rollout_path(code_dir, rel) {
-                return Ok(Some(path));
+            for rel_candidate in rollout_rel_candidates(rel) {
+                if let Some(path) = resolve_rollout_path(code_dir, &rel_candidate) {
+                    return Ok(Some(path));
+                }
             }
-            return Ok(Some(code_dir.join(rel)));
+
+            continue;
         }
     }
 
     Ok(None)
+}
+
+fn rollout_rel_candidates(rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(rel.to_string());
+
+    if let Some(without_snapshot) = rel.strip_suffix(".snapshot.json") {
+        out.push(format!("{}.jsonl", without_snapshot));
+    }
+
+    out
 }
 
 fn resolve_rollout_path(code_dir: &Path, rel: &str) -> Option<PathBuf> {
@@ -1767,6 +1781,106 @@ mod tests {
         .expect("exported");
         let body = fs::read_to_string(&out_file).expect("read output");
         assert!(body.contains("hello from sessions dir"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_uses_jsonl_when_catalog_points_to_snapshot_file() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-snapshot-catalog-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "cccccccc-dddd-eeee-ffff-000000000000";
+        let base_name = format!("rollout-2026-03-18T12-00-00-{}", session_id);
+        let rollout_rel_snapshot = format!("sessions/2026/03/18/{}.snapshot.json", base_name);
+        let rollout_jsonl = rollout_dir.join(format!("{}.jsonl", base_name));
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel_snapshot,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "C:/Users/bmthub"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello from snapshot-catalog fallback"}]
+            }
+        });
+        fs::write(&rollout_jsonl, format!("{}\n{}\n", session_meta, assistant)).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+        assert!(body.contains("hello from snapshot-catalog fallback"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_falls_back_to_scan_when_catalog_rollout_path_is_stale() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-test-stale-catalog-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "dddddddd-eeee-ffff-0000-111111111111";
+        let missing_rel = "sessions/2026/03/18/rollout-2026-03-18T00-00-00-missing.jsonl";
+        let real_rel = format!("sessions/2026/03/18/rollout-2026-03-18T12-30-00-{}.jsonl", session_id);
+        let real_path = code_dir.join(&real_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": missing_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "C:/Users/bmthub"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-03-18T12:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello from stale-catalog fallback"}]
+            }
+        });
+        fs::write(&real_path, format!("{}\n{}\n", session_meta, assistant)).expect("rollout write");
+
+        let out_file = export_session_markdown(session_id, &root.join("out"), ExportMode::Medium, &code_dir)
+            .expect("exported");
+        let body = fs::read_to_string(&out_file).expect("read output");
+        assert!(body.contains("hello from stale-catalog fallback"));
 
         let _ = fs::remove_dir_all(&root);
     }
