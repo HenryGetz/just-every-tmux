@@ -987,14 +987,44 @@ fn normalize_or_exit(raw: &str) -> BrResult<String> {
 }
 
 fn expand_path(path: &str) -> PathBuf {
-    let expanded = shellexpand::full(path)
+    let mut input = path.to_string();
+    if let Some(home) = home_dir_string() {
+        if path == "~" {
+            input = home;
+        } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            input = format!("{}/{}", home, rest);
+        }
+    }
+
+    let expanded = shellexpand::full(&input)
         .map(|s| s.to_string())
-        .unwrap_or_else(|_| path.to_string());
+        .unwrap_or(input);
     let p = PathBuf::from(expanded);
     if p.is_absolute() {
         p
     } else {
         env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+    }
+}
+
+fn home_dir_string() -> Option<String> {
+    if let Ok(home) = env::var("HOME") {
+        if !home.trim().is_empty() {
+            return Some(home);
+        }
+    }
+
+    if let Ok(profile) = env::var("USERPROFILE") {
+        if !profile.trim().is_empty() {
+            return Some(profile);
+        }
+    }
+
+    let drive = env::var("HOMEDRIVE").ok();
+    let path = env::var("HOMEPATH").ok();
+    match (drive, path) {
+        (Some(d), Some(p)) if !d.is_empty() && !p.is_empty() => Some(format!("{}{}", d, p)),
+        _ => None,
     }
 }
 
