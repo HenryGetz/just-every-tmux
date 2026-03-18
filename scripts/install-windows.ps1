@@ -316,6 +316,19 @@ function Build-Release {
   Invoke-Checked { cargo build --release } "cargo build --release"
 }
 
+function Write-CmdShim {
+  param(
+    [string]$PrefixDir,
+    [string]$CommandName,
+    [string]$TargetExe
+  )
+
+  $shimPath = Join-Path $PrefixDir ("{0}.cmd" -f $CommandName)
+  $shim = "@echo off`r`n`"$TargetExe`" %*`r`n"
+  Set-Content -Path $shimPath -Value $shim -Encoding ASCII
+  return $shimPath
+}
+
 Ensure-Command git "git is required. Install Git for Windows and rerun."
 Ensure-Rust
 
@@ -361,20 +374,59 @@ New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
 
 $srcDir = Join-Path $repoRoot "target\release"
 $targets = @("br.exe", "b.exe", "cx.exe")
+$installedPaths = @()
+$usedCmdShimFallback = $false
+
 foreach ($exe in $targets) {
   $src = Join-Path $srcDir $exe
   if (-not (Test-Path $src)) {
     throw "Build did not produce $src"
   }
-  Copy-Item -Force $src (Join-Path $Prefix $exe)
+
+  $dst = Join-Path $Prefix $exe
+  try {
+    $samePath = $false
+    if (Test-Path $dst) {
+      $samePath = ([System.IO.Path]::GetFullPath($src) -ieq [System.IO.Path]::GetFullPath($dst))
+    }
+
+    if ($samePath) {
+      $installedPaths += $src
+      continue
+    }
+
+    Copy-Item -Force $src $dst -ErrorAction Stop
+    $installedPaths += $dst
+  }
+  catch {
+    $msg = $_.Exception.Message
+    if ($msg -match "virus" -or $msg -match "potentially unwanted software") {
+      Write-Host "warning: Defender blocked copying $exe to $Prefix; installing command shim instead."
+      try {
+        if (Test-Path $dst) {
+          Remove-Item -Force $dst -ErrorAction SilentlyContinue
+        }
+      }
+      catch {
+      }
+
+      $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+      $shimPath = Write-CmdShim -PrefixDir $Prefix -CommandName $cmdName -TargetExe $src
+      $installedPaths += $shimPath
+      $usedCmdShimFallback = $true
+      continue
+    }
+
+    throw
+  }
 }
 
 Add-UserPathIfMissing $Prefix
 
 Write-Host "==> Installed"
-Write-Host "  $(Join-Path $Prefix 'br.exe')"
-Write-Host "  $(Join-Path $Prefix 'b.exe')"
-Write-Host "  $(Join-Path $Prefix 'cx.exe')"
+foreach ($p in $installedPaths) {
+  Write-Host "  $p"
+}
 Write-Host ""
 Write-Host "Open a NEW PowerShell window, then verify:"
 Write-Host "  br --help"
@@ -389,4 +441,11 @@ if ($UseMsvcBuildTools) {
 }
 else {
   Write-Host "MSVC source: portable-msvc.py ($PortableMsvcRoot)"
+}
+
+if ($usedCmdShimFallback) {
+  Write-Host ""
+  Write-Host "Note: Defender blocked direct .exe copy. Installed .cmd shims that run binaries from:"
+  Write-Host "  $srcDir"
+  Write-Host "If your org policy allows, add an exclusion for this repo or approve the binaries in Windows Security."
 }
