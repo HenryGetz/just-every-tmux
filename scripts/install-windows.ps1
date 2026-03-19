@@ -482,6 +482,8 @@ foreach ($exe in $targets) {
   }
 
   $dst = Join-Path $Prefix $exe
+  $tmpDst = "$dst.new"
+  $backupDst = "$dst.bak"
   try {
     $samePath = $false
     if (Test-Path $dst) {
@@ -493,24 +495,48 @@ foreach ($exe in $targets) {
       continue
     }
 
-    $tmpDst = "$dst.new"
     if (Test-Path $tmpDst) {
       Remove-Item -Force $tmpDst -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $backupDst) {
+      Remove-Item -Force $backupDst -ErrorAction SilentlyContinue
     }
 
     # Copy to a temporary file first so locked destination binaries do not block updates.
     Copy-Item -Force $src $tmpDst -ErrorAction Stop
 
+    $hadBackup = $false
     if (Test-Path $dst) {
-      Remove-Item -Force $dst -ErrorAction Stop
+      Move-Item -Force $dst $backupDst -ErrorAction Stop
+      $hadBackup = $true
     }
 
-    Move-Item -Force $tmpDst $dst -ErrorAction Stop
+    try {
+      Move-Item -Force $tmpDst $dst -ErrorAction Stop
+      if ($hadBackup -and (Test-Path $backupDst)) {
+        Remove-Item -Force $backupDst -ErrorAction SilentlyContinue
+      }
+    }
+    catch {
+      if ($hadBackup -and (Test-Path $backupDst) -and (-not (Test-Path $dst))) {
+        Move-Item -Force $backupDst $dst -ErrorAction SilentlyContinue
+      }
+      throw
+    }
+
     $installedPaths += $dst
   }
   catch {
     if (Test-Path $tmpDst) {
       Remove-Item -Force $tmpDst -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $backupDst) {
+      if (-not (Test-Path $dst)) {
+        Move-Item -Force $backupDst $dst -ErrorAction SilentlyContinue
+      }
+      else {
+        Remove-Item -Force $backupDst -ErrorAction SilentlyContinue
+      }
     }
 
     if (Test-IsAntivirusBlock -ErrorRecord $_) {
