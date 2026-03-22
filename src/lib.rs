@@ -1924,13 +1924,18 @@ fn kill_session_by_name(app: &mut App, name: String) {
     }
 }
 
-fn rename_session(old_name: &str, new_name: &str) -> BrResult<bool> {
-    let out = tmux_capture(vec![
+fn rename_session_args(old_name: &str, new_name: &str) -> Vec<String> {
+    vec![
         "rename-session".to_string(),
         "-t".to_string(),
         old_name.to_string(),
+        "--".to_string(),
         new_name.to_string(),
-    ])?;
+    ]
+}
+
+fn rename_session(old_name: &str, new_name: &str) -> BrResult<bool> {
+    let out = tmux_capture(rename_session_args(old_name, new_name))?;
     Ok(out.code == 0)
 }
 
@@ -2557,7 +2562,16 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
                 return None;
             };
 
-            let raw = app.rename_session_name.trim().to_string();
+            let entered_name = app.rename_session_name.clone();
+            if entered_name == old_name {
+                app.input_mode = InputMode::Filter;
+                app.rename_target = None;
+                app.rename_session_name.clear();
+                app.set_status_for("Session name unchanged.", Duration::from_millis(900));
+                return None;
+            }
+
+            let raw = entered_name.trim().to_string();
             let normalized = normalize_session_name(&raw);
             if normalized.is_empty() {
                 app.set_status_for(
@@ -3105,8 +3119,9 @@ mod tests {
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
         handle_new_session_mode, handle_rename_session_mode, modal_content, normalize_session_name,
-        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, CopiedOutput,
-        CopyPreview, InputMode, PendingCopy, PendingDelete, PendingExport, SessionInfo,
+        parse_tmux_session_line, paths_match, rename_session_args, session_ids_from_cwd_in, App,
+        CopiedOutput, CopyPreview, InputMode, PendingCopy, PendingDelete, PendingExport,
+        SessionInfo,
     };
 
     fn test_app() -> App {
@@ -3360,6 +3375,41 @@ mod tests {
             .map(|(msg, _)| msg.as_str())
             .unwrap_or("");
         assert!(status.contains("unchanged"));
+    }
+
+    #[test]
+    fn rename_mode_enter_raw_unchanged_is_noop_before_normalize() {
+        let mut app = test_app();
+        app.input_mode = InputMode::RenameSession;
+        app.rename_target = Some("legacy name".to_string());
+        app.rename_session_name = "legacy name".to_string();
+
+        let _ = handle_rename_session_mode(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::Filter));
+        assert!(app.rename_target.is_none());
+        assert!(app.rename_session_name.is_empty());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("unchanged"));
+    }
+
+    #[test]
+    fn rename_session_args_uses_option_terminator_for_new_name() {
+        let args = rename_session_args("old", "-new-name");
+        assert_eq!(
+            args,
+            vec![
+                "rename-session".to_string(),
+                "-t".to_string(),
+                "old".to_string(),
+                "--".to_string(),
+                "-new-name".to_string()
+            ]
+        );
     }
 
     #[test]
