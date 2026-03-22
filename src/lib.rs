@@ -991,6 +991,29 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
             ("wl-copy", vec![]),
             ("xclip", vec!["-selection", "clipboard"]),
             ("xsel", vec!["--clipboard", "--input"]),
+            ("clip.exe", vec![]),
+            ("/mnt/c/Windows/System32/clip.exe", vec![]),
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "[Console]::In.ReadToEnd() | Set-Clipboard",
+                ],
+            ),
+            (
+                "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                vec![
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "[Console]::In.ReadToEnd() | Set-Clipboard",
+                ],
+            ),
+            ("tmux", vec!["load-buffer", "-w", "-"]),
         ] {
             match run_clipboard_command(program, &args, text) {
                 Ok(()) => return Ok(()),
