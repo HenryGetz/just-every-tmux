@@ -18,11 +18,19 @@ pub fn latest_assistant_output_for_session(
     session_id: &str,
     code_dir: &Path,
 ) -> Result<String, String> {
+    assistant_output_from_end_for_session(session_id, code_dir, 0)
+}
+
+pub fn assistant_output_from_end_for_session(
+    session_id: &str,
+    code_dir: &Path,
+    from_end_index: usize,
+) -> Result<String, String> {
     let rollout = rollout_path_for_session(session_id, code_dir)?;
     let file = File::open(&rollout)
         .map_err(|e| format!("failed to open {}: {}", rollout.display(), e))?;
     let reader = BufReader::new(file);
-    let mut last_assistant: Option<String> = None;
+    let mut assistant_outputs: Vec<String> = Vec::new();
 
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -46,12 +54,17 @@ pub fn latest_assistant_output_for_session(
 
         if let Some(text) = assistant_text_from_content(payload.get("content")) {
             if !text.trim().is_empty() {
-                last_assistant = Some(text);
+                assistant_outputs.push(text);
             }
         }
     }
 
-    last_assistant.ok_or_else(|| format!("No assistant output found for session {}", session_id))
+    if assistant_outputs.len() <= from_end_index {
+        return Err(format!("No assistant output found for session {}", session_id));
+    }
+
+    let idx = assistant_outputs.len() - 1 - from_end_index;
+    Ok(assistant_outputs.swap_remove(idx))
 }
 
 #[derive(Clone, Debug)]
@@ -2064,6 +2077,114 @@ mod tests {
         fs::write(&rollout_path, format!("{}\n", user)).expect("rollout write");
 
         let err = latest_assistant_output_for_session(session_id, &code_dir).expect_err("expected error");
+        assert!(err.contains("No assistant output found"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assistant_output_from_end_returns_second_to_last_message() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-prev-assistant-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/22");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let rollout_rel = format!("sessions/2026/03/22/rollout-{}.jsonl", session_id);
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let assistant_a = serde_json::json!({
+            "timestamp": "2026-03-22T10:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "first"}]
+            }
+        });
+        let assistant_b = serde_json::json!({
+            "timestamp": "2026-03-22T10:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "second"}]
+            }
+        });
+        let assistant_c = serde_json::json!({
+            "timestamp": "2026-03-22T10:00:03.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "third"}]
+            }
+        });
+        fs::write(
+            &rollout_path,
+            format!("{}\n{}\n{}\n", assistant_a, assistant_b, assistant_c),
+        )
+        .expect("rollout write");
+
+        let text = assistant_output_from_end_for_session(session_id, &code_dir, 1)
+            .expect("assistant output");
+        assert_eq!(text, "second");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assistant_output_from_end_errors_when_offset_exceeds_history() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-prev-assistant-empty-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/22");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "66666666-7777-8888-9999-000000000000";
+        let rollout_rel = format!("sessions/2026/03/22/rollout-{}.jsonl", session_id);
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let assistant = serde_json::json!({
+            "timestamp": "2026-03-22T10:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "only-one"}]
+            }
+        });
+        fs::write(&rollout_path, format!("{}\n", assistant)).expect("rollout write");
+
+        let err = assistant_output_from_end_for_session(session_id, &code_dir, 1)
+            .expect_err("expected error");
         assert!(err.contains("No assistant output found"));
 
         let _ = fs::remove_dir_all(&root);

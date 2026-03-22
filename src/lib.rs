@@ -161,6 +161,7 @@ struct PendingExport {
 
 struct PendingCopy {
     name: String,
+    target: CopyTarget,
     started_at: Instant,
     rx: Receiver<Result<CopiedOutput, String>>,
     worker: Option<JoinHandle<()>>,
@@ -175,6 +176,28 @@ struct CopyPreview {
     session_name: String,
     markdown: String,
     scroll: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyTarget {
+    Last,
+    Previous,
+}
+
+impl CopyTarget {
+    fn description(self) -> &'static str {
+        match self {
+            CopyTarget::Last => "last",
+            CopyTarget::Previous => "second-to-last",
+        }
+    }
+
+    fn from_end_index(self) -> usize {
+        match self {
+            CopyTarget::Last => 0,
+            CopyTarget::Previous => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -362,7 +385,12 @@ impl App {
         self.status_line = Some((msg.into(), Instant::now() + duration));
     }
 
-    fn set_copy_status(&mut self, session_name: &str, result: Result<CopiedOutput, String>) {
+    fn set_copy_status(
+        &mut self,
+        session_name: &str,
+        target: CopyTarget,
+        result: Result<CopiedOutput, String>,
+    ) {
         match result {
             Ok(copied) => {
                 self.copy_preview = Some(CopyPreview {
@@ -371,7 +399,12 @@ impl App {
                     scroll: 0,
                 });
                 self.set_status_for(
-                    format!("Copied last assistant output from '{}' ({} chars)", session_name, copied.chars),
+                    format!(
+                        "Copied {} assistant output from '{}' ({} chars)",
+                        target.description(),
+                        session_name,
+                        copied.chars
+                    ),
                     Duration::from_secs(2),
                 )
             }
@@ -410,7 +443,7 @@ impl App {
             });
         }
 
-        self.set_copy_status(&pending.name, result);
+        self.set_copy_status(&pending.name, pending.target, result);
     }
 
     fn prune_timers(&mut self) {
@@ -1112,11 +1145,15 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
-fn copy_last_assistant_output_result(name: &str) -> Result<CopiedOutput, String> {
+fn copy_assistant_output_result(name: &str, target: CopyTarget) -> Result<CopiedOutput, String> {
     let session_id = coder_session_id_for_tmux_session(name)
         .ok_or_else(|| format!("No coder session id found for '{}'", name))?;
     let code_dir = export_code_dir();
-    let text = exporter::latest_assistant_output_for_session(&session_id, &code_dir)?;
+    let text = exporter::assistant_output_from_end_for_session(
+        &session_id,
+        &code_dir,
+        target.from_end_index(),
+    )?;
     copy_text_to_clipboard(&text)?;
     Ok(CopiedOutput {
         chars: text.chars().count(),
@@ -1135,7 +1172,7 @@ fn join_copy_worker(worker: Option<JoinHandle<()>>) -> Option<String> {
     }
 }
 
-fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
+fn begin_copy_assistant_output(app: &mut App, name: &str, target: CopyTarget) {
     if app.pending_copy.is_some() {
         app.set_status_for("Copy already in progress...", Duration::from_millis(900));
         return;
@@ -1146,16 +1183,21 @@ fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
     let (tx, rx) = mpsc::channel::<Result<CopiedOutput, String>>();
     let worker_name = session_name.clone();
     let worker = std::thread::spawn(move || {
-        let _ = tx.send(copy_last_assistant_output_result(&worker_name));
+        let _ = tx.send(copy_assistant_output_result(&worker_name, target));
     });
     app.pending_copy = Some(PendingCopy {
         name: session_name.clone(),
+        target,
         started_at: Instant::now(),
         rx,
         worker: Some(worker),
     });
     app.set_status_for(
-        format!("Copying last assistant output from '{}'...", session_name),
+        format!(
+            "Copying {} assistant output from '{}'...",
+            target.description(),
+            session_name
+        ),
         Duration::from_secs(3),
     );
 }
@@ -2164,6 +2206,18 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
         }
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+            app.set_status_for("No session selected", Duration::from_millis(1000));
+            return None;
+        };
+        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -2171,7 +2225,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
                 };
-                begin_copy_last_assistant_output(app, &name);
+                begin_copy_assistant_output(app, &name, CopyTarget::Last);
                 return None;
             }
             KeyCode::Char('c') => return Some(None),
@@ -2288,7 +2342,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                 app.set_status_for("No session selected", Duration::from_millis(1000));
                 return None;
             };
-            begin_copy_last_assistant_output(app, &name);
+            begin_copy_assistant_output(app, &name, CopyTarget::Last);
             None
         }
         KeyCode::F(6) => {
@@ -2443,6 +2497,18 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
         return handle_copy_preview_mode(app, key);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+            app.set_status_for("No session selected", Duration::from_millis(1000));
+            return None;
+        };
+        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -2450,7 +2516,7 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
                 };
-                begin_copy_last_assistant_output(app, &name);
+                begin_copy_assistant_output(app, &name, CopyTarget::Last);
                 return None;
             }
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -2511,6 +2577,18 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
         return handle_copy_preview_mode(app, key);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+            app.set_status_for("No session selected", Duration::from_millis(1000));
+            return None;
+        };
+        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -2518,7 +2596,7 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
                 };
-                begin_copy_last_assistant_output(app, &name);
+                begin_copy_assistant_output(app, &name, CopyTarget::Last);
                 return None;
             }
             KeyCode::Char('c') => return Some(None),
@@ -2724,6 +2802,7 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
             vec![
                 format!("{} Preparing clipboard copy...", spinner),
                 format!("Session: {}", pending.name),
+                format!("Selection: {} assistant output", pending.target.description()),
                 "".to_string(),
                 "This may take a moment.".to_string(),
             ],
@@ -2871,7 +2950,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  Ctrl+Shift+P copy second-last  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -3120,7 +3199,7 @@ mod tests {
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
         handle_new_session_mode, handle_rename_session_mode, modal_content, normalize_session_name,
         parse_tmux_session_line, paths_match, rename_session_args, session_ids_from_cwd_in, App,
-        CopiedOutput, CopyPreview, InputMode, PendingCopy, PendingDelete, PendingExport,
+        CopiedOutput, CopyPreview, CopyTarget, InputMode, PendingCopy, PendingDelete, PendingExport,
         SessionInfo,
     };
 
@@ -3423,6 +3502,31 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("last assistant output"));
+    }
+
+    #[test]
+    fn ctrl_shift_p_copies_second_to_last_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("second-to-last assistant output"));
     }
 
     #[test]
@@ -3458,6 +3562,12 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("last assistant output"));
     }
 
     #[test]
@@ -3472,6 +3582,26 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
+    }
+
+    #[test]
+    fn ctrl_shift_p_copies_second_to_last_in_new_session_mode() {
+        let mut app = test_app();
+        app.input_mode = InputMode::NewSession;
+
+        let action = handle_new_session_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("second-to-last assistant output"));
     }
 
     #[test]
@@ -3503,6 +3633,7 @@ mod tests {
 
         app.pending_copy = Some(PendingCopy {
             name: "alpha".to_string(),
+            target: CopyTarget::Last,
             started_at: Instant::now(),
             rx: rx_result,
             worker: Some(worker),
@@ -3545,6 +3676,7 @@ mod tests {
 
         app.pending_copy = Some(PendingCopy {
             name: "alpha".to_string(),
+            target: CopyTarget::Last,
             started_at: Instant::now(),
             rx: rx_result,
             worker: None,
@@ -3565,6 +3697,7 @@ mod tests {
 
         app.pending_copy = Some(PendingCopy {
             name: "alpha".to_string(),
+            target: CopyTarget::Last,
             started_at: Instant::now(),
             rx: rx_result,
             worker: None,
