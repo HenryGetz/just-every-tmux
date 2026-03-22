@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +30,8 @@ pub fn assistant_output_from_end_for_session(
     let file = File::open(&rollout)
         .map_err(|e| format!("failed to open {}: {}", rollout.display(), e))?;
     let reader = BufReader::new(file);
-    let mut assistant_outputs: Vec<String> = Vec::new();
+    let keep = from_end_index.saturating_add(1).max(1);
+    let mut assistant_outputs: VecDeque<String> = VecDeque::with_capacity(keep);
 
     for line in reader.lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -54,7 +55,10 @@ pub fn assistant_output_from_end_for_session(
 
         if let Some(text) = assistant_text_from_content(payload.get("content")) {
             if !text.trim().is_empty() {
-                assistant_outputs.push(text);
+                assistant_outputs.push_back(text);
+                if assistant_outputs.len() > keep {
+                    assistant_outputs.pop_front();
+                }
             }
         }
     }
@@ -64,7 +68,9 @@ pub fn assistant_output_from_end_for_session(
     }
 
     let idx = assistant_outputs.len() - 1 - from_end_index;
-    Ok(assistant_outputs.swap_remove(idx))
+    assistant_outputs
+        .remove(idx)
+        .ok_or_else(|| format!("No assistant output found for session {}", session_id))
 }
 
 #[derive(Clone, Debug)]

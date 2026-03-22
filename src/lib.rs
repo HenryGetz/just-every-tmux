@@ -176,6 +176,8 @@ struct CopyPreview {
     session_name: String,
     markdown: String,
     scroll: u16,
+    wrapped_lines: usize,
+    viewport_lines: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,6 +399,8 @@ impl App {
                     session_name: session_name.to_string(),
                     markdown: copied.markdown,
                     scroll: 0,
+                    wrapped_lines: 0,
+                    viewport_lines: 0,
                 });
                 self.set_status_for(
                     format!(
@@ -2065,13 +2069,33 @@ fn maybe_kill_selected_pane(app: &mut App, immediate: bool) {
     }
 }
 
-fn markdown_line_count(markdown: &str) -> usize {
-    let count = markdown.lines().count();
-    if count == 0 { 1 } else { count }
+fn wrapped_visual_line_count(markdown: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+
+    // Include instruction + spacer lines that are prepended in markdown_preview_as_text.
+    let mut total = 2usize;
+    if markdown.trim().is_empty() {
+        return total + 1;
+    }
+
+    for line in markdown.lines() {
+        let chars = line.chars().count();
+        let visual = chars.div_ceil(width).max(1);
+        total = total.saturating_add(visual);
+    }
+    total
+}
+
+fn copy_preview_max_scroll(preview: &CopyPreview) -> u16 {
+    let wrapped = preview.wrapped_lines;
+    let viewport = preview.viewport_lines.max(1);
+    wrapped.saturating_sub(viewport) as u16
 }
 
 fn adjust_copy_preview_scroll(preview: &mut CopyPreview, delta: isize) {
-    let max_scroll = markdown_line_count(&preview.markdown).saturating_sub(1) as isize;
+    let max_scroll = copy_preview_max_scroll(preview) as isize;
     let next = (preview.scroll as isize + delta).clamp(0, max_scroll);
     preview.scroll = next as u16;
 }
@@ -2111,7 +2135,7 @@ fn handle_copy_preview_mode(app: &mut App, key: KeyEvent) -> Option<Option<Strin
             None
         }
         KeyCode::End | KeyCode::Char('G') => {
-            preview.scroll = markdown_line_count(&preview.markdown).saturating_sub(1) as u16;
+            preview.scroll = copy_preview_max_scroll(preview);
             None
         }
         _ => None,
@@ -2861,8 +2885,8 @@ fn markdown_preview_as_text(markdown: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-fn draw_modal_overlay(frame: &mut Frame<'_>, app: &App) {
-    if let Some(preview) = app.copy_preview.as_ref() {
+fn draw_modal_overlay(frame: &mut Frame<'_>, app: &mut App) {
+    if let Some(preview) = app.copy_preview.as_mut() {
         let area = frame.area();
         let popup = centered_rect(
             area,
@@ -2878,6 +2902,14 @@ fn draw_modal_overlay(frame: &mut Frame<'_>, app: &App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLOR_ACCENT_2))
             .style(Style::default().bg(COLOR_PANEL));
+
+        let inner = block.inner(popup);
+        preview.viewport_lines = inner.height as usize;
+        preview.wrapped_lines = wrapped_visual_line_count(&preview.markdown, inner.width as usize);
+        let max_scroll = copy_preview_max_scroll(preview);
+        if preview.scroll > max_scroll {
+            preview.scroll = max_scroll;
+        }
 
         frame.render_widget(
             Paragraph::new(markdown_preview_as_text(&preview.markdown))
@@ -3662,6 +3694,8 @@ mod tests {
             session_name: "alpha".to_string(),
             markdown: "# heading\ncontent".to_string(),
             scroll: 0,
+            wrapped_lines: 0,
+            viewport_lines: 0,
         });
 
         let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
