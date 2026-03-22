@@ -212,7 +212,8 @@ impl CopyTarget {
     }
 }
 
-fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
+#[allow(dead_code)]
+fn copy_target_for_shortcut_legacy(key: KeyEvent) -> Option<CopyTarget> {
     if let KeyCode::Char(c) = key.code {
         if c == char::from(0x10) {
             return Some(CopyTarget::Last);
@@ -257,7 +258,8 @@ fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
     }
 }
 
-fn is_copy_picker_shortcut(key: KeyEvent) -> bool {
+#[allow(dead_code)]
+fn is_copy_picker_shortcut_legacy(key: KeyEvent) -> bool {
     if let KeyCode::Char(c) = key.code {
         if c == char::from(0x07) || c == char::from(0x02) {
             return true;
@@ -266,6 +268,36 @@ fn is_copy_picker_shortcut(key: KeyEvent) -> bool {
 
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('\'') | KeyCode::Char('"'))
+}
+
+fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
+    match key.code {
+        // Enhanced keyboard protocol path.
+        KeyCode::Char('p') | KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::Last)
+        }
+        // Legacy control-byte path (Ctrl+P -> DLE, 0x10).
+        KeyCode::Char(c) if c == char::from(0x10) => Some(CopyTarget::Last),
+        _ => None,
+    }
+}
+
+fn is_copy_picker_shortcut(key: KeyEvent) -> bool {
+    match key.code {
+        // Enhanced keyboard protocol path.
+        KeyCode::Char('\'') | KeyCode::Char('"') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            true
+        }
+        // Legacy control-byte path for Ctrl+' (BEL, 0x07) and Ctrl+" (STX, 0x02).
+        KeyCode::Char(c) if c == char::from(0x07) || c == char::from(0x02) => true,
+        // Some terminals normalize these as Ctrl+G / Ctrl+B.
+        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Char('b') | KeyCode::Char('B')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3354,8 +3386,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        copy_target_for_shortcut, desired_sessions_panel_width, extract_session_id_from_path,
-        fuzzy_score, handle_filter_mode, handle_new_session_mode, handle_rename_session_mode,
+        desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
+        handle_new_session_mode, handle_rename_session_mode, is_copy_picker_shortcut,
         modal_content, normalize_session_name, parse_tmux_session_line, paths_match,
         rename_session_args, session_ids_from_cwd_in, wrapped_visual_line_count, App,
         CopiedOutput, CopyPreview, CopyTarget, InputMode, PendingCopy, PendingDelete,
@@ -3729,84 +3761,30 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_left_bracket_copies_second_to_last_in_filter_mode() {
-        let mut app = test_app();
+    fn control_symbol_keycodes_map_to_picker_shortcuts() {
+        let ctrl_single_quote = char::from_u32(0x07).expect("ctrl-'");
+        let ctrl_double_quote = char::from_u32(0x02).expect("ctrl-\"");
 
-        let action = handle_filter_mode(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL),
-        );
-
-        assert!(action.is_none());
-        assert!(app.status_line.is_some());
-        let status = app
-            .status_line
-            .as_ref()
-            .map(|(msg, _)| msg.as_str())
-            .unwrap_or("");
-        assert!(status.contains("second-to-last assistant output"));
+        assert!(is_copy_picker_shortcut(KeyEvent::new(
+            KeyCode::Char(ctrl_single_quote),
+            KeyModifiers::NONE
+        )));
+        assert!(is_copy_picker_shortcut(KeyEvent::new(
+            KeyCode::Char(ctrl_double_quote),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
-    fn ctrl_right_bracket_copies_third_to_last_in_filter_mode() {
-        let mut app = test_app();
-
-        let action = handle_filter_mode(
-            &mut app,
-            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
-        );
-
-        assert!(action.is_none());
-        assert!(app.status_line.is_some());
-        let status = app
-            .status_line
-            .as_ref()
-            .map(|(msg, _)| msg.as_str())
-            .unwrap_or("");
-        assert!(status.contains("third-to-last assistant output"));
-    }
-
-    #[test]
-    fn control_symbol_keycodes_map_to_expected_copy_targets() {
-        let ctrl_open_bracket = char::from_u32(0x1b).expect("ctrl-[");
-        let ctrl_close_bracket = char::from_u32(0x1d).expect("ctrl-]");
-        let ctrl_backslash = char::from_u32(0x1c).expect("ctrl-\\");
-
-        assert_eq!(
-            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_open_bracket), KeyModifiers::NONE)),
-            Some(CopyTarget::SecondLast)
-        );
-        assert_eq!(
-            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_close_bracket), KeyModifiers::NONE)),
-            Some(CopyTarget::ThirdLast)
-        );
-        assert_eq!(
-            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_backslash), KeyModifiers::NONE)),
-            Some(CopyTarget::FourthLast)
-        );
-        assert_eq!(
-            copy_target_for_shortcut(KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
-            Some(CopyTarget::SecondLast)
-        );
-    }
-
-    #[test]
-    fn ctrl_backslash_copies_fourth_to_last_in_filter_mode() {
-        let mut app = test_app();
-
-        let action = handle_filter_mode(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
-        );
-
-        assert!(action.is_none());
-        assert!(app.status_line.is_some());
-        let status = app
-            .status_line
-            .as_ref()
-            .map(|(msg, _)| msg.as_str())
-            .unwrap_or("");
-        assert!(status.contains("fourth-to-last assistant output"));
+    fn ctrl_g_and_ctrl_b_also_open_copy_picker() {
+        assert!(is_copy_picker_shortcut(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_copy_picker_shortcut(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
@@ -3873,23 +3851,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_left_bracket_copies_second_to_last_in_new_session_mode() {
+    fn ctrl_quote_opens_copy_picker_in_new_session_mode() {
         let mut app = test_app();
         app.input_mode = InputMode::NewSession;
 
         let action = handle_new_session_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\''), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
-        assert!(app.status_line.is_some());
-        let status = app
-            .status_line
-            .as_ref()
-            .map(|(msg, _)| msg.as_str())
-            .unwrap_or("");
-        assert!(status.contains("second-to-last assistant output"));
+        assert!(app.pending_copy_picker.is_some());
     }
 
     #[test]
