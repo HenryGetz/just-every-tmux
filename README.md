@@ -90,7 +90,13 @@ br
 - `F9`: force-kill selected session
 - `Ctrl+S`: open export mode chooser
 - `Ctrl+P` / `F10`: copy last assistant output from selected chat to clipboard
+  - after copy completes, opens a fullscreen preview modal of the copied markdown
+  - `Esc` / `Enter` closes preview, arrows or `j/k` scroll
 - `q`: quit
+
+Text input shortcuts (filter/new/rename fields):
+
+- `Alt+Backspace` / `Ctrl+W`: delete previous word
 
 ## Exporter (`cx`)
 

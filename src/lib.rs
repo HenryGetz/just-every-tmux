@@ -18,8 +18,8 @@ use once_cell::sync::Lazy;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use regex::Regex;
 use serde_json::Value;
@@ -162,8 +162,19 @@ struct PendingExport {
 struct PendingCopy {
     name: String,
     started_at: Instant,
-    rx: Receiver<Result<usize, String>>,
+    rx: Receiver<Result<CopiedOutput, String>>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct CopiedOutput {
+    chars: usize,
+    markdown: String,
+}
+
+struct CopyPreview {
+    session_name: String,
+    markdown: String,
+    scroll: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +217,7 @@ struct App {
     pending_pane_delete: Option<PendingPaneDelete>,
     pending_export: Option<PendingExport>,
     pending_copy: Option<PendingCopy>,
+    copy_preview: Option<CopyPreview>,
     show_help: bool,
     show_preview: bool,
     pending_g_until: Option<Instant>,
@@ -245,6 +257,7 @@ impl App {
             pending_pane_delete: None,
             pending_export: None,
             pending_copy: None,
+            copy_preview: None,
             show_help: true,
             show_preview: true,
             pending_g_until: None,
@@ -349,12 +362,19 @@ impl App {
         self.status_line = Some((msg.into(), Instant::now() + duration));
     }
 
-    fn set_copy_status(&mut self, session_name: &str, result: Result<usize, String>) {
+    fn set_copy_status(&mut self, session_name: &str, result: Result<CopiedOutput, String>) {
         match result {
-            Ok(chars) => self.set_status_for(
-                format!("Copied last assistant output from '{}' ({} chars)", session_name, chars),
-                Duration::from_secs(2),
-            ),
+            Ok(copied) => {
+                self.copy_preview = Some(CopyPreview {
+                    session_name: session_name.to_string(),
+                    markdown: copied.markdown,
+                    scroll: 0,
+                });
+                self.set_status_for(
+                    format!("Copied last assistant output from '{}' ({} chars)", session_name, copied.chars),
+                    Duration::from_secs(2),
+                )
+            }
             Err(err) => self.set_status_for(
                 format!("Copy failed: {}", ellipsize(&err, 140)),
                 Duration::from_secs(3),
@@ -1092,13 +1112,16 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
-fn copy_last_assistant_output_result(name: &str) -> Result<usize, String> {
+fn copy_last_assistant_output_result(name: &str) -> Result<CopiedOutput, String> {
     let session_id = coder_session_id_for_tmux_session(name)
         .ok_or_else(|| format!("No coder session id found for '{}'", name))?;
     let code_dir = export_code_dir();
     let text = exporter::latest_assistant_output_for_session(&session_id, &code_dir)?;
     copy_text_to_clipboard(&text)?;
-    Ok(text.chars().count())
+    Ok(CopiedOutput {
+        chars: text.chars().count(),
+        markdown: text,
+    })
 }
 
 fn join_copy_worker(worker: Option<JoinHandle<()>>) -> Option<String> {
@@ -1118,8 +1141,9 @@ fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
         return;
     }
 
+    app.copy_preview = None;
     let session_name = name.to_string();
-    let (tx, rx) = mpsc::channel::<Result<usize, String>>();
+    let (tx, rx) = mpsc::channel::<Result<CopiedOutput, String>>();
     let worker_name = session_name.clone();
     let worker = std::thread::spawn(move || {
         let _ = tx.send(copy_last_assistant_output_result(&worker_name));
@@ -1756,6 +1780,13 @@ fn delete_last_word(text: &mut String) {
     *text = chars.into_iter().collect();
 }
 
+fn is_word_delete_backspace(key: KeyEvent) -> bool {
+    key.code == KeyCode::Backspace
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 fn quick_open_index_for_digit(c: char) -> Option<usize> {
     match c {
         '1' => Some(0),
@@ -1987,7 +2018,64 @@ fn maybe_kill_selected_pane(app: &mut App, immediate: bool) {
     }
 }
 
+fn markdown_line_count(markdown: &str) -> usize {
+    let count = markdown.lines().count();
+    if count == 0 { 1 } else { count }
+}
+
+fn adjust_copy_preview_scroll(preview: &mut CopyPreview, delta: isize) {
+    let max_scroll = markdown_line_count(&preview.markdown).saturating_sub(1) as isize;
+    let next = (preview.scroll as isize + delta).clamp(0, max_scroll);
+    preview.scroll = next as u16;
+}
+
+fn handle_copy_preview_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    let Some(preview) = app.copy_preview.as_mut() else {
+        return None;
+    };
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Some(None);
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char(' ') => {
+            app.copy_preview = None;
+            None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            adjust_copy_preview_scroll(preview, -1);
+            None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            adjust_copy_preview_scroll(preview, 1);
+            None
+        }
+        KeyCode::PageUp | KeyCode::Char('b') => {
+            adjust_copy_preview_scroll(preview, -12);
+            None
+        }
+        KeyCode::PageDown | KeyCode::Char('f') => {
+            adjust_copy_preview_scroll(preview, 12);
+            None
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            preview.scroll = 0;
+            None
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            preview.scroll = markdown_line_count(&preview.markdown).saturating_sub(1) as u16;
+            None
+        }
+        _ => None,
+    }
+}
+
 fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if app.copy_preview.is_some() {
+        return handle_copy_preview_mode(app, key);
+    }
+
     if !matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G')) {
         app.pending_g_until = None;
     }
@@ -2276,7 +2364,11 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
         }
         KeyCode::Backspace | KeyCode::Delete => {
             if !app.filter.is_empty() {
-                app.filter.pop();
+                if is_word_delete_backspace(key) {
+                    delete_last_word(&mut app.filter);
+                } else {
+                    app.filter.pop();
+                }
                 app.selected = 0;
                 app.refresh_items();
             } else if key.code == KeyCode::Backspace && key.modifiers == KeyModifiers::NONE {
@@ -2342,6 +2434,10 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
 }
 
 fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if app.copy_preview.is_some() {
+        return handle_copy_preview_mode(app, key);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -2378,7 +2474,11 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
             None
         }
         KeyCode::Backspace | KeyCode::Delete => {
-            app.new_session_name.pop();
+            if is_word_delete_backspace(key) {
+                delete_last_word(&mut app.new_session_name);
+            } else {
+                app.new_session_name.pop();
+            }
             None
         }
         KeyCode::Enter => {
@@ -2402,6 +2502,10 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
 }
 
 fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if app.copy_preview.is_some() {
+        return handle_copy_preview_mode(app, key);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -2438,7 +2542,11 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
             None
         }
         KeyCode::Backspace | KeyCode::Delete => {
-            app.rename_session_name.pop();
+            if is_word_delete_backspace(key) {
+                delete_last_word(&mut app.rename_session_name);
+            } else {
+                app.rename_session_name.pop();
+            }
             None
         }
         KeyCode::Enter => {
@@ -2611,7 +2719,84 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
     None
 }
 
+fn markdown_preview_as_text(markdown: &str) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Esc/Enter close  •  ↑/↓ or j/k scroll  •  PgUp/PgDn jump",
+        Style::default().fg(COLOR_MUTED),
+    )));
+    lines.push(Line::from(""));
+
+    if markdown.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(copied output was empty)",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        return Text::from(lines);
+    }
+
+    let mut in_code_block = false;
+    for raw in markdown.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            lines.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(COLOR_ACCENT_2),
+            )));
+            continue;
+        }
+
+        let style = if in_code_block {
+            Style::default().fg(Color::Rgb(207, 223, 244))
+        } else if trimmed.starts_with('#') {
+            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+        {
+            Style::default().fg(COLOR_ACCENT_2)
+        } else if trimmed.starts_with('>') {
+            Style::default().fg(COLOR_MUTED).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+
+        lines.push(Line::from(Span::styled(raw.to_string(), style)));
+    }
+
+    Text::from(lines)
+}
+
 fn draw_modal_overlay(frame: &mut Frame<'_>, app: &App) {
+    if let Some(preview) = app.copy_preview.as_ref() {
+        let area = frame.area();
+        let popup = centered_rect(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+
+        frame.render_widget(Clear, popup);
+
+        let block = Block::default()
+            .title(format!(" Copied Markdown — {} ", preview.session_name))
+            .title_style(Style::default().fg(COLOR_ACCENT_2).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLOR_ACCENT_2))
+            .style(Style::default().bg(COLOR_PANEL));
+
+        frame.render_widget(
+            Paragraph::new(markdown_preview_as_text(&preview.markdown))
+                .block(block)
+                .scroll((preview.scroll, 0))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(COLOR_PANEL)),
+            popup,
+        );
+        return;
+    }
+
     let Some((title, lines)) = modal_content(app) else {
         return;
     };
@@ -2672,7 +2857,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  F4 rename selected  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2695,14 +2880,14 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         }
         InputMode::NewSession => (
             format!(
-                "New session name: {}  (Enter create, Esc cancel)",
+                "New session name: {}  (Enter create, Esc cancel, Alt+Backspace/Ctrl+W word-del)",
                 app.new_session_name
             ),
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
         ),
         InputMode::RenameSession => (
             format!(
-                "Rename session to: {}  (Enter save, Esc cancel)",
+                "Rename session to: {}  (Enter save, Esc cancel, Alt+Backspace/Ctrl+W word-del)",
                 app.rename_session_name
             ),
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
@@ -2920,8 +3105,8 @@ mod tests {
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
         handle_new_session_mode, handle_rename_session_mode, modal_content, normalize_session_name,
-        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, InputMode, PendingCopy, PendingDelete,
-        PendingExport, SessionInfo,
+        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, CopiedOutput,
+        CopyPreview, InputMode, PendingCopy, PendingDelete, PendingExport, SessionInfo,
     };
 
     fn test_app() -> App {
@@ -2943,6 +3128,7 @@ mod tests {
             pending_pane_delete: None,
             pending_export: None,
             pending_copy: None,
+            copy_preview: None,
             show_help: true,
             show_preview: false,
             pending_g_until: None,
@@ -3042,6 +3228,48 @@ mod tests {
         );
 
         assert_eq!(app.new_session_name, "feature ");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_in_filter_mode() {
+        let mut app = test_app();
+        app.filter = "alpha beta".to_string();
+        app.refresh_items();
+
+        let _ = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+
+        assert_eq!(app.filter, "alpha ");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_in_new_session_mode() {
+        let mut app = test_app();
+        app.input_mode = InputMode::NewSession;
+        app.new_session_name = "feature branch".to_string();
+
+        let _ = handle_new_session_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+
+        assert_eq!(app.new_session_name, "feature ");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_in_rename_mode() {
+        let mut app = test_app();
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        app.rename_session_name = "alpha beta".to_string();
+
+        let _ = handle_rename_session_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+
+        assert_eq!(app.rename_session_name, "alpha ");
     }
 
     #[test]
@@ -3213,11 +3441,14 @@ mod tests {
     fn pending_copy_wait_mode_blocks_until_worker_finishes() {
         let mut app = test_app();
         let (tx_start, rx_start) = mpsc::channel::<()>();
-        let (tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+        let (tx_result, rx_result) = mpsc::channel::<Result<CopiedOutput, String>>();
 
         let worker = std::thread::spawn(move || {
             let _ = rx_start.recv();
-            let _ = tx_result.send(Ok(42));
+            let _ = tx_result.send(Ok(CopiedOutput {
+                chars: 42,
+                markdown: "# done".to_string(),
+            }));
         });
 
         app.pending_copy = Some(PendingCopy {
@@ -3240,12 +3471,27 @@ mod tests {
             .map(|(msg, _)| msg.as_str())
             .unwrap_or("");
         assert!(status.contains("Copied last assistant output"));
+        assert!(app.copy_preview.is_some());
+    }
+
+    #[test]
+    fn copy_preview_closes_on_escape() {
+        let mut app = test_app();
+        app.copy_preview = Some(CopyPreview {
+            session_name: "alpha".to_string(),
+            markdown: "# heading\ncontent".to_string(),
+            scroll: 0,
+        });
+
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.copy_preview.is_none());
     }
 
     #[test]
     fn modal_prioritizes_export_prompt_over_copy_overlay() {
         let mut app = test_app();
-        let (_tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+        let (_tx_result, rx_result) = mpsc::channel::<Result<CopiedOutput, String>>();
 
         app.pending_copy = Some(PendingCopy {
             name: "alpha".to_string(),
@@ -3265,7 +3511,7 @@ mod tests {
     #[test]
     fn modal_prioritizes_delete_prompt_over_copy_overlay() {
         let mut app = test_app();
-        let (_tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+        let (_tx_result, rx_result) = mpsc::channel::<Result<CopiedOutput, String>>();
 
         app.pending_copy = Some(PendingCopy {
             name: "alpha".to_string(),
