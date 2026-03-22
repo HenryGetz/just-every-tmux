@@ -159,6 +159,10 @@ struct PendingExport {
     when: Instant,
 }
 
+struct PendingCopyPicker {
+    name: String,
+}
+
 struct PendingCopy {
     name: String,
     target: CopyTarget,
@@ -253,6 +257,17 @@ fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
     }
 }
 
+fn is_copy_picker_shortcut(key: KeyEvent) -> bool {
+    if let KeyCode::Char(c) = key.code {
+        if c == char::from(0x07) || c == char::from(0x02) {
+            return true;
+        }
+    }
+
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('\'') | KeyCode::Char('"'))
+}
+
 #[derive(Clone, Copy)]
 enum ExportDepth {
     Compact,
@@ -292,6 +307,7 @@ struct App {
     pending_delete: Option<PendingDelete>,
     pending_pane_delete: Option<PendingPaneDelete>,
     pending_export: Option<PendingExport>,
+    pending_copy_picker: Option<PendingCopyPicker>,
     pending_copy: Option<PendingCopy>,
     copy_preview: Option<CopyPreview>,
     show_help: bool,
@@ -333,6 +349,7 @@ impl App {
             pending_delete: None,
             pending_pane_delete: None,
             pending_export: None,
+            pending_copy_picker: None,
             pending_copy: None,
             copy_preview: None,
             show_help: true,
@@ -1234,6 +1251,7 @@ fn begin_copy_assistant_output(app: &mut App, name: &str, target: CopyTarget) {
         return;
     }
 
+    app.pending_copy_picker = None;
     app.copy_preview = None;
     let session_name = name.to_string();
     let (tx, rx) = mpsc::channel::<Result<CopiedOutput, String>>();
@@ -2153,6 +2171,51 @@ fn adjust_copy_preview_scroll(preview: &mut CopyPreview, delta: isize) {
     preview.scroll = next as u16;
 }
 
+fn start_copy_picker(app: &mut App) {
+    let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+        app.set_status_for("No session selected", Duration::from_millis(1000));
+        return;
+    };
+
+    app.pending_copy_picker = Some(PendingCopyPicker { name: name.clone() });
+    app.set_status_for(
+        format!("Pick assistant output from '{}' (1-4, Enter=1, Esc cancel)", name),
+        Duration::from_secs(8),
+    );
+}
+
+fn handle_copy_picker_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    let Some(picker) = app.pending_copy_picker.as_ref() else {
+        return None;
+    };
+    let name = picker.name.clone();
+
+    let selected_target = match key.code {
+        KeyCode::Enter | KeyCode::Char('1') => Some(CopyTarget::Last),
+        KeyCode::Char('2') => Some(CopyTarget::SecondLast),
+        KeyCode::Char('3') => Some(CopyTarget::ThirdLast),
+        KeyCode::Char('4') => Some(CopyTarget::FourthLast),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.pending_copy_picker = None;
+            app.set_status_for("Copy picker canceled.", Duration::from_millis(900));
+            return None;
+        }
+        _ => {
+            app.set_status_for(
+                "Choose 1/2/3/4 (Enter=1, Esc cancel)",
+                Duration::from_millis(900),
+            );
+            return None;
+        }
+    };
+
+    if let Some(target) = selected_target {
+        app.pending_copy_picker = None;
+        begin_copy_assistant_output(app, &name, target);
+    }
+    None
+}
+
 fn handle_copy_preview_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
     let Some(preview) = app.copy_preview.as_mut() else {
         return None;
@@ -2198,6 +2261,10 @@ fn handle_copy_preview_mode(app: &mut App, key: KeyEvent) -> Option<Option<Strin
 fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
     if app.copy_preview.is_some() {
         return handle_copy_preview_mode(app, key);
+    }
+
+    if app.pending_copy_picker.is_some() {
+        return handle_copy_picker_mode(app, key);
     }
 
     if !matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G')) {
@@ -2281,6 +2348,11 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             }
             _ => {}
         }
+    }
+
+    if is_copy_picker_shortcut(key) {
+        start_copy_picker(app);
+        return None;
     }
 
     if let Some(target) = copy_target_for_shortcut(key) {
@@ -2563,6 +2635,15 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
         return handle_copy_preview_mode(app, key);
     }
 
+    if app.pending_copy_picker.is_some() {
+        return handle_copy_picker_mode(app, key);
+    }
+
+    if is_copy_picker_shortcut(key) {
+        start_copy_picker(app);
+        return None;
+    }
+
     if let Some(target) = copy_target_for_shortcut(key) {
         let Some(name) = app.selected_name().map(|s| s.to_string()) else {
             app.set_status_for("No session selected", Duration::from_millis(1000));
@@ -2630,6 +2711,15 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
 fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
     if app.copy_preview.is_some() {
         return handle_copy_preview_mode(app, key);
+    }
+
+    if app.pending_copy_picker.is_some() {
+        return handle_copy_picker_mode(app, key);
+    }
+
+    if is_copy_picker_shortcut(key) {
+        start_copy_picker(app);
+        return None;
     }
 
     if let Some(target) = copy_target_for_shortcut(key) {
@@ -2837,6 +2927,22 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
         ));
     }
 
+    if let Some(picker) = app.pending_copy_picker.as_ref() {
+        return Some((
+            "Copy Assistant Output".to_string(),
+            vec![
+                format!("Session: {}", picker.name),
+                "".to_string(),
+                "1 -> last".to_string(),
+                "2 -> second-to-last".to_string(),
+                "3 -> third-to-last".to_string(),
+                "4 -> fourth-to-last".to_string(),
+                "Enter -> last".to_string(),
+                "Esc / q / n -> cancel".to_string(),
+            ],
+        ));
+    }
+
     if let Some(pending) = app.pending_copy.as_ref() {
         let frames = ["-", "\\", "|", "/"];
         let ticks = now.duration_since(pending.started_at).as_millis() / 120;
@@ -3002,7 +3108,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 last copy  Ctrl+[ second  Ctrl+] third  Ctrl+\\ fourth  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 last copy  Ctrl+'/Ctrl\" pick 1-4  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -3274,6 +3380,7 @@ mod tests {
             pending_delete: None,
             pending_pane_delete: None,
             pending_export: None,
+            pending_copy_picker: None,
             pending_copy: None,
             copy_preview: None,
             show_help: true,
@@ -3561,6 +3668,64 @@ mod tests {
             .map(|(msg, _)| msg.as_str())
             .unwrap_or("");
         assert!(status.contains("last assistant output"));
+    }
+
+    #[test]
+    fn ctrl_single_quote_opens_copy_picker_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('\''), KeyModifiers::CONTROL),
+        );
+
+        assert!(action.is_none());
+        assert!(app.pending_copy_picker.is_some());
+    }
+
+    #[test]
+    fn ctrl_double_quote_opens_copy_picker_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('"'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+
+        assert!(action.is_none());
+        assert!(app.pending_copy_picker.is_some());
+    }
+
+    #[test]
+    fn copy_picker_choice_three_starts_third_to_last_copy() {
+        let mut app = test_app();
+
+        let _ = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('\''), KeyModifiers::CONTROL),
+        );
+        assert!(app.pending_copy_picker.is_some());
+
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+
+        let pending = app.pending_copy.as_ref().expect("copy started");
+        assert_eq!(pending.target, CopyTarget::ThirdLast);
+    }
+
+    #[test]
+    fn copy_picker_esc_cancels_without_starting_copy() {
+        let mut app = test_app();
+
+        let _ = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('\''), KeyModifiers::CONTROL),
+        );
+        assert!(app.pending_copy_picker.is_some());
+
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.pending_copy_picker.is_none());
+        assert!(app.pending_copy.is_none());
     }
 
     #[test]
