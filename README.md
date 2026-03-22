@@ -90,7 +90,9 @@ br
 - `F9`: force-kill selected session
 - `Ctrl+S`: open export mode chooser
 - `Ctrl+P` / `F10`: copy last assistant output from selected chat to clipboard
-- `Ctrl+Shift+P`: copy second-to-last assistant output from selected chat
+- `Ctrl+[` : copy second-to-last assistant output from selected chat
+- `Ctrl+]` : copy third-to-last assistant output from selected chat
+- `Ctrl+\` : copy fourth-to-last assistant output from selected chat
   - after copy completes, opens a fullscreen preview modal of the copied markdown
   - `Esc` / `Enter` closes preview, arrows or `j/k` scroll
 - `q`: quit

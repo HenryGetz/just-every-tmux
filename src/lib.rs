@@ -183,22 +183,42 @@ struct CopyPreview {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CopyTarget {
     Last,
-    Previous,
+    SecondLast,
+    ThirdLast,
+    FourthLast,
 }
 
 impl CopyTarget {
     fn description(self) -> &'static str {
         match self {
             CopyTarget::Last => "last",
-            CopyTarget::Previous => "second-to-last",
+            CopyTarget::SecondLast => "second-to-last",
+            CopyTarget::ThirdLast => "third-to-last",
+            CopyTarget::FourthLast => "fourth-to-last",
         }
     }
 
     fn from_end_index(self) -> usize {
         match self {
             CopyTarget::Last => 0,
-            CopyTarget::Previous => 1,
+            CopyTarget::SecondLast => 1,
+            CopyTarget::ThirdLast => 2,
+            CopyTarget::FourthLast => 3,
         }
+    }
+}
+
+fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('p') | KeyCode::Char('P') => Some(CopyTarget::Last),
+        KeyCode::Char('[') => Some(CopyTarget::SecondLast),
+        KeyCode::Char(']') => Some(CopyTarget::ThirdLast),
+        KeyCode::Char('\\') => Some(CopyTarget::FourthLast),
+        _ => None,
     }
 }
 
@@ -2230,28 +2250,17 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
         }
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-    {
+    if let Some(target) = copy_target_for_shortcut(key) {
         let Some(name) = app.selected_name().map(|s| s.to_string()) else {
             app.set_status_for("No session selected", Duration::from_millis(1000));
             return None;
         };
-        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        begin_copy_assistant_output(app, &name, target);
         return None;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-                    app.set_status_for("No session selected", Duration::from_millis(1000));
-                    return None;
-                };
-                begin_copy_assistant_output(app, &name, CopyTarget::Last);
-                return None;
-            }
             KeyCode::Char('c') => return Some(None),
             KeyCode::Char('q') | KeyCode::Char('Q') => return Some(None),
             KeyCode::Char('j') => {
@@ -2521,28 +2530,17 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
         return handle_copy_preview_mode(app, key);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-    {
+    if let Some(target) = copy_target_for_shortcut(key) {
         let Some(name) = app.selected_name().map(|s| s.to_string()) else {
             app.set_status_for("No session selected", Duration::from_millis(1000));
             return None;
         };
-        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        begin_copy_assistant_output(app, &name, target);
         return None;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-                    app.set_status_for("No session selected", Duration::from_millis(1000));
-                    return None;
-                };
-                begin_copy_assistant_output(app, &name, CopyTarget::Last);
-                return None;
-            }
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 return Some(None);
             }
@@ -2601,28 +2599,17 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
         return handle_copy_preview_mode(app, key);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-    {
+    if let Some(target) = copy_target_for_shortcut(key) {
         let Some(name) = app.selected_name().map(|s| s.to_string()) else {
             app.set_status_for("No session selected", Duration::from_millis(1000));
             return None;
         };
-        begin_copy_assistant_output(app, &name, CopyTarget::Previous);
+        begin_copy_assistant_output(app, &name, target);
         return None;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-                    app.set_status_for("No session selected", Duration::from_millis(1000));
-                    return None;
-                };
-                begin_copy_assistant_output(app, &name, CopyTarget::Last);
-                return None;
-            }
             KeyCode::Char('c') => return Some(None),
             KeyCode::Char('u') => {
                 app.rename_session_name.clear();
@@ -2982,7 +2969,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  Ctrl+Shift+P copy second-last  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 last copy  Ctrl+[ second  Ctrl+] third  Ctrl+\\ fourth  F4 rename selected  Alt+Backspace/Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -3543,12 +3530,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_p_copies_second_to_last_in_filter_mode() {
+    fn ctrl_left_bracket_copies_second_to_last_in_filter_mode() {
         let mut app = test_app();
 
         let action = handle_filter_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
@@ -3559,6 +3546,44 @@ mod tests {
             .map(|(msg, _)| msg.as_str())
             .unwrap_or("");
         assert!(status.contains("second-to-last assistant output"));
+    }
+
+    #[test]
+    fn ctrl_right_bracket_copies_third_to_last_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("third-to-last assistant output"));
+    }
+
+    #[test]
+    fn ctrl_backslash_copies_fourth_to_last_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("fourth-to-last assistant output"));
     }
 
     #[test]
@@ -3617,13 +3642,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_p_copies_second_to_last_in_new_session_mode() {
+    fn ctrl_left_bracket_copies_second_to_last_in_new_session_mode() {
         let mut app = test_app();
         app.input_mode = InputMode::NewSession;
 
         let action = handle_new_session_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
