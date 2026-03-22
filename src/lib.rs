@@ -1720,6 +1720,43 @@ fn delete_last_word(text: &mut String) {
     *text = chars.into_iter().collect();
 }
 
+fn quick_open_index_for_digit(c: char) -> Option<usize> {
+    match c {
+        '1' => Some(0),
+        '2' => Some(1),
+        '3' => Some(2),
+        '4' => Some(3),
+        '5' => Some(4),
+        '6' => Some(5),
+        '7' => Some(6),
+        '8' => Some(7),
+        '9' => Some(8),
+        '0' => Some(9),
+        _ => None,
+    }
+}
+
+fn hotkey_label_for_index(idx: usize) -> String {
+    let key = match idx {
+        0 => Some('1'),
+        1 => Some('2'),
+        2 => Some('3'),
+        3 => Some('4'),
+        4 => Some('5'),
+        5 => Some('6'),
+        6 => Some('7'),
+        7 => Some('8'),
+        8 => Some('9'),
+        9 => Some('0'),
+        _ => None,
+    };
+
+    match key {
+        Some(c) => format!("[{}] ", c),
+        None => "    ".to_string(),
+    }
+}
+
 fn clear_filter(app: &mut App) {
     if !app.filter.is_empty() {
         app.filter.clear();
@@ -2214,6 +2251,22 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             None
         }
         KeyCode::Char(c)
+            if key.modifiers == KeyModifiers::NONE
+                && app.filter.is_empty()
+                && quick_open_index_for_digit(c).is_some() =>
+        {
+            let idx = quick_open_index_for_digit(c).expect("digit mapped");
+            if idx < app.items.len() {
+                Some(Some(app.items[idx].name.clone()))
+            } else {
+                app.set_status_for(
+                    format!("No session bound to quick key '{}'.", c),
+                    Duration::from_millis(900),
+                );
+                None
+            }
+        }
+        KeyCode::Char(c)
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
@@ -2301,8 +2354,9 @@ fn desired_sessions_panel_width(items: &[SessionInfo]) -> u16 {
         .unwrap_or(12)
         .clamp(12, 44);
 
+    let hotkey_col = 4usize;
     let ago_col = 10usize;
-    let content_width = max_name_len + 2 + ago_col;
+    let content_width = hotkey_col + max_name_len + 2 + ago_col;
     (content_width + 4) as u16
 }
 
@@ -2439,7 +2493,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(title, chunks[0]);
 
     let help_1_text = if app.show_help {
-        "Enter/Space open  ↑/↓ move  j/k move  gg top  Shift+G bottom  Tab/Shift+Tab move  PgUp/PgDn jump"
+        "Enter/Space open  1-9/0 quick-open recent  ↑/↓ move  j/k move  gg top  Shift+G bottom  Tab/Shift+Tab move  PgUp/PgDn jump"
     } else {
         "F1/? help  Enter/Space open  n/F2 new  F3 preview  F7 pane-kill  F8/F9 sess-kill  r refresh  q quit"
     };
@@ -2504,8 +2558,11 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
 
     let list_area = content_chunks[0];
     let content_width = list_area.width.saturating_sub(4) as usize;
+    let hotkey_col_w = 4usize;
     let ago_col_w = 10usize.min(content_width.saturating_sub(8));
-    let name_col_w = content_width.saturating_sub(2 + ago_col_w).max(8);
+    let name_col_w = content_width
+        .saturating_sub(hotkey_col_w + 2 + ago_col_w)
+        .max(8);
 
     let items: Vec<ListItem<'_>> = if app.items.is_empty() {
         vec![ListItem::new(
@@ -2514,10 +2571,15 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         app.items
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(idx, s)| {
                 let name = ellipsize(&s.name, name_col_w);
                 let ago = format_ago(s.sort_ts());
                 let header = Line::from(vec![
+                    Span::styled(
+                        format!("{:<hotkey_w$}", hotkey_label_for_index(idx), hotkey_w = hotkey_col_w),
+                        Style::default().fg(COLOR_ACCENT),
+                    ),
                     Span::styled(
                         format!("{:<name_w$}", name, name_w = name_col_w),
                         Style::default().fg(COLOR_TEXT),
@@ -2745,6 +2807,34 @@ mod tests {
     }
 
     #[test]
+    fn number_hotkey_opens_recent_session() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(action, Some(Some(name)) if name == "alpha"));
+    }
+
+    #[test]
+    fn zero_hotkey_opens_tenth_session() {
+        let mut app = test_app();
+        app.all_sessions = (1..=10)
+            .map(|i| SessionInfo::new(format!("s{:02}", i), 0, 0, 0))
+            .collect();
+        app.refresh_items();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(action, Some(Some(name)) if name == "s10"));
+    }
+
+    #[test]
     fn ctrl_w_deletes_word_in_new_session_mode() {
         let mut app = test_app();
         app.input_mode = InputMode::NewSession;
@@ -2879,7 +2969,7 @@ mod tests {
     #[test]
     fn desired_session_width_is_clamped() {
         let extreme = vec![SessionInfo::new("x".repeat(500), 0, 0, 0)];
-        assert_eq!(desired_sessions_panel_width(&extreme), 60);
+        assert_eq!(desired_sessions_panel_width(&extreme), 64);
     }
 
     #[test]
