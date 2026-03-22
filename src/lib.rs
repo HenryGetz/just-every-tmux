@@ -2328,9 +2328,31 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
 }
 
 fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+            app.set_status_for("No session selected", Duration::from_millis(1000));
+            return None;
+        };
+        begin_copy_last_assistant_output(app, &name);
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') => return Some(None),
+            KeyCode::Char('C') => {
+                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+                    app.set_status_for("No session selected", Duration::from_millis(1000));
+                    return None;
+                };
+                begin_copy_last_assistant_output(app, &name);
+                return None;
+            }
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                return Some(None);
+            }
             KeyCode::Char('u') => {
                 app.new_session_name.clear();
                 return None;
@@ -2987,6 +3009,33 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_in_new_session_mode() {
+        let mut app = test_app();
+        app.input_mode = InputMode::NewSession;
+
+        let action = handle_new_session_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_quits_in_new_session_mode() {
+        let mut app = test_app();
+        app.input_mode = InputMode::NewSession;
+
+        let action = handle_new_session_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, Some(None)));
     }
 
     #[test]
