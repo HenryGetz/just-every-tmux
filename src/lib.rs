@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
@@ -156,6 +157,12 @@ struct PendingExport {
     when: Instant,
 }
 
+struct PendingCopy {
+    name: String,
+    started_at: Instant,
+    rx: Receiver<Result<usize, String>>,
+}
+
 #[derive(Clone, Copy)]
 enum ExportDepth {
     Compact,
@@ -193,6 +200,7 @@ struct App {
     pending_delete: Option<PendingDelete>,
     pending_pane_delete: Option<PendingPaneDelete>,
     pending_export: Option<PendingExport>,
+    pending_copy: Option<PendingCopy>,
     show_help: bool,
     show_preview: bool,
     pending_g_until: Option<Instant>,
@@ -229,6 +237,7 @@ impl App {
             pending_delete: None,
             pending_pane_delete: None,
             pending_export: None,
+            pending_copy: None,
             show_help: true,
             show_preview: true,
             pending_g_until: None,
@@ -354,6 +363,36 @@ impl App {
                 self.pending_export = None;
             }
         }
+
+        let mut copy_result: Option<Result<usize, String>> = None;
+        if let Some(pending) = self.pending_copy.as_ref() {
+            match pending.rx.try_recv() {
+                Ok(result) => copy_result = Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    copy_result = Some(Err("copy worker disconnected".to_string()))
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(result) = copy_result {
+            let name = self
+                .pending_copy
+                .as_ref()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "session".to_string());
+            self.pending_copy = None;
+            match result {
+                Ok(chars) => self.set_status_for(
+                    format!("Copied last assistant output from '{}' ({} chars)", name, chars),
+                    Duration::from_secs(2),
+                ),
+                Err(err) => self.set_status_for(
+                    format!("Copy failed: {}", ellipsize(&err, 140)),
+                    Duration::from_secs(3),
+                ),
+            }
+        }
+
         if let Some(until) = self.pending_g_until {
             if Instant::now() >= until {
                 self.pending_g_until = None;
@@ -1029,42 +1068,36 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
-fn copy_last_assistant_output(app: &mut App, name: &str) {
-    let Some(session_id) = coder_session_id_for_tmux_session(name) else {
-        app.set_status_for(
-            format!("No coder session id found for '{}'", name),
-            Duration::from_millis(1800),
-        );
-        return;
-    };
-
+fn copy_last_assistant_output_result(name: &str) -> Result<usize, String> {
+    let session_id = coder_session_id_for_tmux_session(name)
+        .ok_or_else(|| format!("No coder session id found for '{}'", name))?;
     let code_dir = export_code_dir();
-    match exporter::latest_assistant_output_for_session(&session_id, &code_dir) {
-        Ok(text) => match copy_text_to_clipboard(&text) {
-            Ok(()) => {
-                app.set_status_for(
-                    format!(
-                        "Copied last assistant output from '{}' ({} chars)",
-                        name,
-                        text.chars().count()
-                    ),
-                    Duration::from_secs(2),
-                );
-            }
-            Err(err) => {
-                app.set_status_for(
-                    format!("Clipboard copy failed: {}", ellipsize(&err, 140)),
-                    Duration::from_secs(3),
-                );
-            }
-        },
-        Err(err) => {
-            app.set_status_for(
-                format!("Copy failed: {}", ellipsize(&err, 140)),
-                Duration::from_secs(3),
-            );
-        }
+    let text = exporter::latest_assistant_output_for_session(&session_id, &code_dir)?;
+    copy_text_to_clipboard(&text)?;
+    Ok(text.chars().count())
+}
+
+fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
+    if app.pending_copy.is_some() {
+        app.set_status_for("Copy already in progress...", Duration::from_millis(900));
+        return;
     }
+
+    let session_name = name.to_string();
+    let (tx, rx) = mpsc::channel::<Result<usize, String>>();
+    app.pending_copy = Some(PendingCopy {
+        name: session_name.clone(),
+        started_at: Instant::now(),
+        rx,
+    });
+    app.set_status_for(
+        format!("Copying last assistant output from '{}'...", session_name),
+        Duration::from_secs(3),
+    );
+
+    std::thread::spawn(move || {
+        let _ = tx.send(copy_last_assistant_output_result(&session_name));
+    });
 }
 
 fn start_export_prompt(app: &mut App) {
@@ -1952,7 +1985,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             app.set_status_for("No session selected", Duration::from_millis(1000));
             return None;
         };
-        copy_last_assistant_output(app, &name);
+        begin_copy_last_assistant_output(app, &name);
         return None;
     }
 
@@ -1963,7 +1996,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
                 };
-                copy_last_assistant_output(app, &name);
+                begin_copy_last_assistant_output(app, &name);
                 return None;
             }
             KeyCode::Char('c') => return Some(None),
@@ -2080,7 +2113,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
                 app.set_status_for("No session selected", Duration::from_millis(1000));
                 return None;
             };
-            copy_last_assistant_output(app, &name);
+            begin_copy_last_assistant_output(app, &name);
             None
         }
         KeyCode::F(6) => {
@@ -2307,6 +2340,22 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
     let now = Instant::now();
+
+    if let Some(pending) = app.pending_copy.as_ref() {
+        let frames = ["-", "\\", "|", "/"];
+        let ticks = now.duration_since(pending.started_at).as_millis() / 120;
+        let spinner = frames[(ticks as usize) % frames.len()];
+        return Some((
+            "Copying".to_string(),
+            vec![
+                format!("{} Preparing clipboard copy...", spinner),
+                format!("Session: {}", pending.name),
+                "".to_string(),
+                "This may take a moment.".to_string(),
+            ],
+        ));
+    }
+
     if let Some(pending) = app.pending_export.as_ref().filter(|p| now < p.when) {
         return Some((
             "Export Markdown".to_string(),
@@ -2635,6 +2684,7 @@ mod tests {
             pending_delete: None,
             pending_pane_delete: None,
             pending_export: None,
+            pending_copy: None,
             show_help: true,
             show_preview: false,
             pending_g_until: None,
