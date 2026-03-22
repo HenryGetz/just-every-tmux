@@ -209,15 +209,46 @@ impl CopyTarget {
 }
 
 fn copy_target_for_shortcut(key: KeyEvent) -> Option<CopyTarget> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
+    if let KeyCode::Char(c) = key.code {
+        if c == char::from(0x10) {
+            return Some(CopyTarget::Last);
+        }
+        if c == char::from(0x1b) {
+            return Some(CopyTarget::SecondLast);
+        }
+        if c == char::from(0x1d) {
+            return Some(CopyTarget::ThirdLast);
+        }
+        if c == char::from(0x1c) {
+            return Some(CopyTarget::FourthLast);
+        }
+    }
+
+    if matches!(key.code, KeyCode::Esc) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(CopyTarget::SecondLast);
     }
 
     match key.code {
-        KeyCode::Char('p') | KeyCode::Char('P') => Some(CopyTarget::Last),
-        KeyCode::Char('[') => Some(CopyTarget::SecondLast),
-        KeyCode::Char(']') => Some(CopyTarget::ThirdLast),
-        KeyCode::Char('\\') => Some(CopyTarget::FourthLast),
+        // Standard ctrl+char decoding path (e.g. kitty CSI-u / enhanced keyboard protocol).
+        KeyCode::Char('p') | KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::Last)
+        }
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::SecondLast)
+        }
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::ThirdLast)
+        }
+        KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::FourthLast)
+        }
+        // Legacy terminal decoding path where ctrl+symbol is emitted as ASCII control chars.
+        KeyCode::Char('') => Some(CopyTarget::Last),
+        KeyCode::Char('') | KeyCode::Esc if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(CopyTarget::SecondLast)
+        }
+        KeyCode::Char('') => Some(CopyTarget::ThirdLast),
+        KeyCode::Char('') => Some(CopyTarget::FourthLast),
         _ => None,
     }
 }
@@ -282,6 +313,7 @@ const COLOR_ACCENT_2: Color = Color::Rgb(107, 224, 186);
 const COLOR_WARN: Color = Color::Rgb(255, 205, 125);
 const COLOR_SELECTED_BG: Color = Color::Rgb(58, 108, 175);
 const COLOR_SELECTED_FG: Color = Color::Rgb(245, 250, 255);
+const COPY_PREVIEW_HINT: &str = "Esc/Enter close  •  ↑/↓ or j/k scroll  •  PgUp/PgDn jump";
 
 impl App {
     fn new() -> Self {
@@ -2094,10 +2126,11 @@ fn wrapped_visual_line_count(markdown: &str, width: usize) -> usize {
         return 1;
     }
 
-    // Include instruction + spacer lines that are prepended in markdown_preview_as_text.
-    let mut total = 2usize;
+    let hint_lines = COPY_PREVIEW_HINT.chars().count().div_ceil(width).max(1);
+    let mut total = hint_lines + 1;
     if markdown.trim().is_empty() {
-        return total + 1;
+        let empty = "(copied output was empty)";
+        return total + empty.chars().count().div_ceil(width).max(1);
     }
 
     for line in markdown.lines() {
@@ -2826,7 +2859,7 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
 fn markdown_preview_as_text(markdown: &str) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "Esc/Enter close  •  ↑/↓ or j/k scroll  •  PgUp/PgDn jump",
+        COPY_PREVIEW_HINT,
         Style::default().fg(COLOR_MUTED),
     )));
     lines.push(Line::from(""));
@@ -3215,11 +3248,12 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
-        handle_new_session_mode, handle_rename_session_mode, modal_content, normalize_session_name,
-        parse_tmux_session_line, paths_match, rename_session_args, session_ids_from_cwd_in, App,
-        CopiedOutput, CopyPreview, CopyTarget, InputMode, PendingCopy, PendingDelete, PendingExport,
-        SessionInfo,
+        copy_target_for_shortcut, desired_sessions_panel_width, extract_session_id_from_path,
+        fuzzy_score, handle_filter_mode, handle_new_session_mode, handle_rename_session_mode,
+        modal_content, normalize_session_name, parse_tmux_session_line, paths_match,
+        rename_session_args, session_ids_from_cwd_in, wrapped_visual_line_count, App,
+        CopiedOutput, CopyPreview, CopyTarget, InputMode, PendingCopy, PendingDelete,
+        PendingExport, SessionInfo,
     };
 
     fn test_app() -> App {
@@ -3568,6 +3602,30 @@ mod tests {
     }
 
     #[test]
+    fn control_symbol_keycodes_map_to_expected_copy_targets() {
+        let ctrl_open_bracket = char::from_u32(0x1b).expect("ctrl-[");
+        let ctrl_close_bracket = char::from_u32(0x1d).expect("ctrl-]");
+        let ctrl_backslash = char::from_u32(0x1c).expect("ctrl-\\");
+
+        assert_eq!(
+            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_open_bracket), KeyModifiers::NONE)),
+            Some(CopyTarget::SecondLast)
+        );
+        assert_eq!(
+            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_close_bracket), KeyModifiers::NONE)),
+            Some(CopyTarget::ThirdLast)
+        );
+        assert_eq!(
+            copy_target_for_shortcut(KeyEvent::new(KeyCode::Char(ctrl_backslash), KeyModifiers::NONE)),
+            Some(CopyTarget::FourthLast)
+        );
+        assert_eq!(
+            copy_target_for_shortcut(KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL)),
+            Some(CopyTarget::SecondLast)
+        );
+    }
+
+    #[test]
     fn ctrl_backslash_copies_fourth_to_last_in_filter_mode() {
         let mut app = test_app();
 
@@ -3584,6 +3642,14 @@ mod tests {
             .map(|(msg, _)| msg.as_str())
             .unwrap_or("");
         assert!(status.contains("fourth-to-last assistant output"));
+    }
+
+    #[test]
+    fn wrapped_visual_lines_count_instruction_wrapping() {
+        // Very narrow widths force the instruction hint line itself to wrap.
+        let narrow = wrapped_visual_line_count("body", 10);
+        let wide = wrapped_visual_line_count("body", 120);
+        assert!(narrow > wide);
     }
 
     #[test]
