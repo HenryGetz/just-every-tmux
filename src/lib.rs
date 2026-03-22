@@ -2045,21 +2045,9 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
         }
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
-        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-            app.set_status_for("No session selected", Duration::from_millis(1000));
-            return None;
-        };
-        begin_copy_last_assistant_output(app, &name);
-        return None;
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('C') => {
+            KeyCode::Char('p') | KeyCode::Char('P') => {
                 let Some(name) = app.selected_name().map(|s| s.to_string()) else {
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
@@ -2121,10 +2109,6 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             }
             KeyCode::Char('n') => {
                 move_selection_down(app, 1);
-                return None;
-            }
-            KeyCode::Char('p') => {
-                move_selection_up(app, 1);
                 return None;
             }
             KeyCode::Char('a') => {
@@ -2328,21 +2312,9 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
 }
 
 fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
-        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-            app.set_status_for("No session selected", Duration::from_millis(1000));
-            return None;
-        };
-        begin_copy_last_assistant_output(app, &name);
-        return None;
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('C') => {
+            KeyCode::Char('p') | KeyCode::Char('P') => {
                 let Some(name) = app.selected_name().map(|s| s.to_string()) else {
                     app.set_status_for("No session selected", Duration::from_millis(1000));
                     return None;
@@ -2554,7 +2526,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C/F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2964,12 +2936,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_triggers_copy_instead_of_quit() {
+    fn ctrl_p_triggers_copy_instead_of_quit() {
         let mut app = test_app();
 
         let action = handle_filter_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
@@ -2999,12 +2971,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_upper_c_copies_in_filter_mode() {
+    fn ctrl_upper_p_copies_in_filter_mode() {
         let mut app = test_app();
 
         let action = handle_filter_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
@@ -3012,13 +2984,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_copies_in_new_session_mode() {
+    fn ctrl_p_copies_in_new_session_mode() {
         let mut app = test_app();
         app.input_mode = InputMode::NewSession;
 
         let action = handle_new_session_mode(
             &mut app,
-            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
         );
 
         assert!(action.is_none());
