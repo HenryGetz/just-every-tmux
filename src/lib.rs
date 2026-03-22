@@ -135,6 +135,7 @@ struct CmdResult {
 enum InputMode {
     Filter,
     NewSession,
+    RenameSession,
 }
 
 struct PendingOpen {
@@ -197,6 +198,8 @@ struct App {
     selected: usize,
     input_mode: InputMode,
     new_session_name: String,
+    rename_session_name: String,
+    rename_target: Option<String>,
     status_line: Option<(String, Instant)>,
     pending_open: Option<PendingOpen>,
     pending_delete: Option<PendingDelete>,
@@ -234,6 +237,8 @@ impl App {
             selected: 0,
             input_mode: InputMode::Filter,
             new_session_name: String::new(),
+            rename_session_name: String::new(),
+            rename_target: None,
             status_line: None,
             pending_open: None,
             pending_delete: None,
@@ -1852,6 +1857,17 @@ fn prompt_delete_selected_session(app: &mut App) {
     );
 }
 
+fn start_rename_prompt(app: &mut App) {
+    let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+        app.set_status_for("No session selected", Duration::from_millis(1000));
+        return;
+    };
+
+    app.input_mode = InputMode::RenameSession;
+    app.rename_target = Some(name.clone());
+    app.rename_session_name = name;
+}
+
 fn kill_session_by_name(app: &mut App, name: String) {
     app.pending_delete = None;
     match kill_session(&name) {
@@ -1875,6 +1891,16 @@ fn kill_session_by_name(app: &mut App, name: String) {
             );
         }
     }
+}
+
+fn rename_session(old_name: &str, new_name: &str) -> BrResult<bool> {
+    let out = tmux_capture(vec![
+        "rename-session".to_string(),
+        "-t".to_string(),
+        old_name.to_string(),
+        new_name.to_string(),
+    ])?;
+    Ok(out.code == 0)
 }
 
 fn maybe_kill_selected_session(app: &mut App, immediate: bool) {
@@ -2147,6 +2173,10 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             app.new_session_name.clear();
             None
         }
+        KeyCode::F(4) => {
+            start_rename_prompt(app);
+            None
+        }
         KeyCode::F(3) => {
             app.show_preview = !app.show_preview;
             app.refresh_preview_if_needed(true);
@@ -2371,6 +2401,122 @@ fn handle_new_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String
     }
 }
 
+fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+                    app.set_status_for("No session selected", Duration::from_millis(1000));
+                    return None;
+                };
+                begin_copy_last_assistant_output(app, &name);
+                return None;
+            }
+            KeyCode::Char('c') => return Some(None),
+            KeyCode::Char('u') => {
+                app.rename_session_name.clear();
+                return None;
+            }
+            KeyCode::Char('w') => {
+                delete_last_word(&mut app.rename_session_name);
+                return None;
+            }
+            KeyCode::Backspace => {
+                delete_last_word(&mut app.rename_session_name);
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Filter;
+            app.rename_target = None;
+            app.rename_session_name.clear();
+            app.set_status_for("Rename canceled.", Duration::from_millis(900));
+            None
+        }
+        KeyCode::Backspace | KeyCode::Delete => {
+            app.rename_session_name.pop();
+            None
+        }
+        KeyCode::Enter => {
+            let Some(old_name) = app.rename_target.clone() else {
+                app.input_mode = InputMode::Filter;
+                app.rename_session_name.clear();
+                app.set_status_for("No session selected", Duration::from_millis(1000));
+                return None;
+            };
+
+            let raw = app.rename_session_name.trim().to_string();
+            let normalized = normalize_session_name(&raw);
+            if normalized.is_empty() {
+                app.set_status_for(
+                    "Invalid name (allowed: A-Za-z0-9 . _ : -)",
+                    Duration::from_millis(1400),
+                );
+                return None;
+            }
+
+            if normalized == old_name {
+                app.input_mode = InputMode::Filter;
+                app.rename_target = None;
+                app.rename_session_name.clear();
+                app.set_status_for("Session name unchanged.", Duration::from_millis(900));
+                return None;
+            }
+
+            if app.all_sessions.iter().any(|s| s.name == normalized) {
+                app.set_status_for(
+                    format!("Session '{}' already exists.", normalized),
+                    Duration::from_millis(1400),
+                );
+                return None;
+            }
+
+            match rename_session(&old_name, &normalized) {
+                Ok(true) => {
+                    app.input_mode = InputMode::Filter;
+                    app.rename_target = None;
+                    app.rename_session_name.clear();
+                    app.refresh_sessions();
+                    if let Some(idx) = app.items.iter().position(|s| s.name == normalized) {
+                        app.selected = idx;
+                    }
+                    app.set_status_for(
+                        format!("Renamed '{}' -> '{}'.", old_name, normalized),
+                        Duration::from_millis(1600),
+                    );
+                }
+                Ok(false) => {
+                    app.set_status_for(
+                        format!("Failed to rename '{}' -> '{}'.", old_name, normalized),
+                        Duration::from_millis(1600),
+                    );
+                }
+                Err(err) => {
+                    app.set_status_for(
+                        format!("Rename failed: {}", err.msg.trim_end()),
+                        Duration::from_millis(1700),
+                    );
+                }
+            }
+            None
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                && (c.is_ascii_graphic() || c == ' ') =>
+        {
+            app.rename_session_name.push(c);
+            None
+        }
+        _ => None,
+    }
+}
+
 fn desired_sessions_panel_width(items: &[SessionInfo]) -> u16 {
     let max_name_len = items
         .iter()
@@ -2520,13 +2666,13 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let help_1_text = if app.show_help {
         "Enter/Space open  1-9/0 quick-open recent  ↑/↓ move  j/k move  gg top  Shift+G bottom  Tab/Shift+Tab move  PgUp/PgDn jump"
     } else {
-        "F1/? help  Enter/Space open  n/F2 new  F3 preview  F7 pane-kill  F8/F9 sess-kill  r refresh  q quit"
+        "F1/? help  Enter/Space open  n/F2 new  F3 preview  F4 rename  F7 pane-kill  F8/F9 sess-kill  r refresh  q quit"
     };
     let help_1 = Paragraph::new(help_1_text).style(Style::default().fg(COLOR_MUTED));
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+P/F10 copy last AI output  F4 rename selected  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2551,6 +2697,13 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
             format!(
                 "New session name: {}  (Enter create, Esc cancel)",
                 app.new_session_name
+            ),
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+        ),
+        InputMode::RenameSession => (
+            format!(
+                "Rename session to: {}  (Enter save, Esc cancel)",
+                app.rename_session_name
             ),
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
         ),
@@ -2739,6 +2892,7 @@ fn tui(_mode: Mode) -> BrResult<Option<String>> {
                 let action = match app.input_mode {
                     InputMode::Filter => handle_filter_mode(&mut app, key_event),
                     InputMode::NewSession => handle_new_session_mode(&mut app, key_event),
+                    InputMode::RenameSession => handle_rename_session_mode(&mut app, key_event),
                 };
 
                 app.refresh_preview_if_needed(false);
@@ -2765,8 +2919,8 @@ mod tests {
 
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
-        handle_new_session_mode, modal_content, normalize_session_name, parse_tmux_session_line,
-        paths_match, session_ids_from_cwd_in, App, InputMode, PendingCopy, PendingDelete,
+        handle_new_session_mode, handle_rename_session_mode, modal_content, normalize_session_name,
+        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, InputMode, PendingCopy, PendingDelete,
         PendingExport, SessionInfo,
     };
 
@@ -2781,6 +2935,8 @@ mod tests {
             selected: 0,
             input_mode: InputMode::Filter,
             new_session_name: String::new(),
+            rename_session_name: String::new(),
+            rename_target: None,
             status_line: None,
             pending_open: None,
             pending_delete: None,
@@ -2933,6 +3089,49 @@ mod tests {
 
         let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pending_export.is_none());
+    }
+
+    #[test]
+    fn f4_enters_rename_mode_with_selected_name() {
+        let mut app = test_app();
+
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::RenameSession));
+        assert_eq!(app.rename_target.as_deref(), Some("alpha"));
+        assert_eq!(app.rename_session_name, "alpha");
+    }
+
+    #[test]
+    fn rename_mode_esc_cancels_and_returns_to_filter() {
+        let mut app = test_app();
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, InputMode::RenameSession));
+
+        let _ = handle_rename_session_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::Filter));
+        assert!(app.rename_target.is_none());
+        assert!(app.rename_session_name.is_empty());
+    }
+
+    #[test]
+    fn rename_mode_enter_same_name_is_noop() {
+        let mut app = test_app();
+        let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert!(matches!(app.input_mode, InputMode::RenameSession));
+
+        let _ = handle_rename_session_mode(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.input_mode, InputMode::Filter));
+        assert!(app.rename_target.is_none());
+        assert!(app.rename_session_name.is_empty());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("unchanged"));
     }
 
     #[test]

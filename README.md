@@ -85,6 +85,7 @@ br
 - `Enter` / `Space`: open selected session
 - `n` or `F2`: create new session
 - `F3`: toggle preview pane
+- `F4`: rename selected session
 - `F8` / `Ctrl+X`: kill selected session (with confirmation)
 - `F9`: force-kill selected session
 - `Ctrl+S`: open export mode chooser
