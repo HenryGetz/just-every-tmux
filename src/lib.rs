@@ -2043,6 +2043,14 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
             maybe_kill_selected_session(app, true);
             None
         }
+        KeyCode::F(10) => {
+            let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+                app.set_status_for("No session selected", Duration::from_millis(1000));
+                return None;
+            };
+            copy_last_assistant_output(app, &name);
+            None
+        }
         KeyCode::F(6) => {
             app.step_preview_pane(-1);
             None
@@ -2358,7 +2366,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C or F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2723,6 +2731,16 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
         );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
+    }
+
+    #[test]
+    fn f10_triggers_copy_last_output() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
