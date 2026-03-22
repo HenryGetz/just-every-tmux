@@ -1958,7 +1958,15 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => return Some(None),
+            KeyCode::Char('C') => {
+                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+                    app.set_status_for("No session selected", Duration::from_millis(1000));
+                    return None;
+                };
+                copy_last_assistant_output(app, &name);
+                return None;
+            }
+            KeyCode::Char('c') => return Some(None),
             KeyCode::Char('q') | KeyCode::Char('Q') => return Some(None),
             KeyCode::Char('j') => {
                 app.step_preview_pane(1);
@@ -2780,6 +2788,19 @@ mod tests {
         );
 
         assert!(matches!(action, Some(None)));
+    }
+
+    #[test]
+    fn ctrl_upper_c_copies_in_filter_mode() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
     }
 
     #[test]
