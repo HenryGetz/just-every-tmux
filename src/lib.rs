@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
@@ -161,6 +162,7 @@ struct PendingCopy {
     name: String,
     started_at: Instant,
     rx: Receiver<Result<usize, String>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +344,50 @@ impl App {
         self.status_line = Some((msg.into(), Instant::now() + duration));
     }
 
+    fn set_copy_status(&mut self, session_name: &str, result: Result<usize, String>) {
+        match result {
+            Ok(chars) => self.set_status_for(
+                format!("Copied last assistant output from '{}' ({} chars)", session_name, chars),
+                Duration::from_secs(2),
+            ),
+            Err(err) => self.set_status_for(
+                format!("Copy failed: {}", ellipsize(&err, 140)),
+                Duration::from_secs(3),
+            ),
+        }
+    }
+
+    fn drain_pending_copy(&mut self, wait: bool) {
+        let Some(mut pending) = self.pending_copy.take() else {
+            return;
+        };
+
+        let mut result = if wait {
+            match pending.rx.recv() {
+                Ok(result) => result,
+                Err(_) => Err("copy worker disconnected".to_string()),
+            }
+        } else {
+            match pending.rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Disconnected) => Err("copy worker disconnected".to_string()),
+                Err(TryRecvError::Empty) => {
+                    self.pending_copy = Some(pending);
+                    return;
+                }
+            }
+        };
+
+        if let Some(join_error) = join_copy_worker(pending.worker.take()) {
+            result = Err(match result {
+                Ok(_) => join_error,
+                Err(err) => format!("{} | {}", err, join_error),
+            });
+        }
+
+        self.set_copy_status(&pending.name, result);
+    }
+
     fn prune_timers(&mut self) {
         if let Some((_, until)) = &self.status_line {
             if Instant::now() >= *until {
@@ -364,34 +410,7 @@ impl App {
             }
         }
 
-        let mut copy_result: Option<Result<usize, String>> = None;
-        if let Some(pending) = self.pending_copy.as_ref() {
-            match pending.rx.try_recv() {
-                Ok(result) => copy_result = Some(result),
-                Err(TryRecvError::Disconnected) => {
-                    copy_result = Some(Err("copy worker disconnected".to_string()))
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(result) = copy_result {
-            let name = self
-                .pending_copy
-                .as_ref()
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "session".to_string());
-            self.pending_copy = None;
-            match result {
-                Ok(chars) => self.set_status_for(
-                    format!("Copied last assistant output from '{}' ({} chars)", name, chars),
-                    Duration::from_secs(2),
-                ),
-                Err(err) => self.set_status_for(
-                    format!("Copy failed: {}", ellipsize(&err, 140)),
-                    Duration::from_secs(3),
-                ),
-            }
-        }
+        self.drain_pending_copy(false);
 
         if let Some(until) = self.pending_g_until {
             if Instant::now() >= until {
@@ -1077,6 +1096,17 @@ fn copy_last_assistant_output_result(name: &str) -> Result<usize, String> {
     Ok(text.chars().count())
 }
 
+fn join_copy_worker(worker: Option<JoinHandle<()>>) -> Option<String> {
+    let Some(handle) = worker else {
+        return None;
+    };
+
+    match handle.join() {
+        Ok(()) => None,
+        Err(_) => Some("copy worker panicked".to_string()),
+    }
+}
+
 fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
     if app.pending_copy.is_some() {
         app.set_status_for("Copy already in progress...", Duration::from_millis(900));
@@ -1085,19 +1115,20 @@ fn begin_copy_last_assistant_output(app: &mut App, name: &str) {
 
     let session_name = name.to_string();
     let (tx, rx) = mpsc::channel::<Result<usize, String>>();
+    let worker_name = session_name.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(copy_last_assistant_output_result(&worker_name));
+    });
     app.pending_copy = Some(PendingCopy {
         name: session_name.clone(),
         started_at: Instant::now(),
         rx,
+        worker: Some(worker),
     });
     app.set_status_for(
         format!("Copying last assistant output from '{}'...", session_name),
         Duration::from_secs(3),
     );
-
-    std::thread::spawn(move || {
-        let _ = tx.send(copy_last_assistant_output_result(&session_name));
-    });
 }
 
 fn start_export_prompt(app: &mut App) {
@@ -2395,21 +2426,6 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
     let now = Instant::now();
 
-    if let Some(pending) = app.pending_copy.as_ref() {
-        let frames = ["-", "\\", "|", "/"];
-        let ticks = now.duration_since(pending.started_at).as_millis() / 120;
-        let spinner = frames[(ticks as usize) % frames.len()];
-        return Some((
-            "Copying".to_string(),
-            vec![
-                format!("{} Preparing clipboard copy...", spinner),
-                format!("Session: {}", pending.name),
-                "".to_string(),
-                "This may take a moment.".to_string(),
-            ],
-        ));
-    }
-
     if let Some(pending) = app.pending_export.as_ref().filter(|p| now < p.when) {
         return Some((
             "Export Markdown".to_string(),
@@ -2433,6 +2449,21 @@ fn modal_content(app: &App) -> Option<(String, Vec<String>)> {
                 "".to_string(),
                 "y -> delete".to_string(),
                 "n / Esc -> cancel".to_string(),
+            ],
+        ));
+    }
+
+    if let Some(pending) = app.pending_copy.as_ref() {
+        let frames = ["-", "\\", "|", "/"];
+        let ticks = now.duration_since(pending.started_at).as_millis() / 120;
+        let spinner = frames[(ticks as usize) % frames.len()];
+        return Some((
+            "Copying".to_string(),
+            vec![
+                format!("{} Preparing clipboard copy...", spinner),
+                format!("Session: {}", pending.name),
+                "".to_string(),
+                "This may take a moment.".to_string(),
             ],
         ));
     }
@@ -2684,16 +2715,29 @@ fn tui(_mode: Mode) -> BrResult<Option<String>> {
             }
         }
 
-        terminal
+        if let Err(err) = terminal
             .draw(|frame| draw_ui(frame, &mut app))
-            .map_err(|err| ExitError::new(1, format!("[br] failed to draw UI: {}\n", err)))?;
-
-        if event::poll(Duration::from_millis(300))
-            .map_err(|err| ExitError::new(1, format!("[br] event poll failed: {}\n", err)))?
+            .map_err(|err| ExitError::new(1, format!("[br] failed to draw UI: {}\n", err)))
         {
-            if let Event::Key(key_event) = event::read()
-                .map_err(|err| ExitError::new(1, format!("[br] event read failed: {}\n", err)))?
+            break Err(err);
+        }
+
+        let should_handle_event = match event::poll(Duration::from_millis(300))
+            .map_err(|err| ExitError::new(1, format!("[br] event poll failed: {}\n", err)))
+        {
+            Ok(ready) => ready,
+            Err(err) => break Err(err),
+        };
+
+        if should_handle_event {
+            let event = match event::read()
+                .map_err(|err| ExitError::new(1, format!("[br] event read failed: {}\n", err)))
             {
+                Ok(event) => event,
+                Err(err) => break Err(err),
+            };
+
+            if let Event::Key(key_event) = event {
                 if key_event.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -2713,21 +2757,23 @@ fn tui(_mode: Mode) -> BrResult<Option<String>> {
     };
 
     restore_terminal(&mut terminal);
+    app.drain_pending_copy(true);
     result
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score,
-        handle_filter_mode, handle_new_session_mode, normalize_session_name,
-        parse_tmux_session_line, paths_match, session_ids_from_cwd_in, App, InputMode,
-        SessionInfo,
+        desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
+        handle_new_session_mode, modal_content, normalize_session_name, parse_tmux_session_line,
+        paths_match, session_ids_from_cwd_in, App, InputMode, PendingCopy, PendingDelete,
+        PendingExport, SessionInfo,
     };
 
     fn test_app() -> App {
@@ -2941,6 +2987,79 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.status_line.is_some());
+    }
+
+    #[test]
+    fn pending_copy_wait_mode_blocks_until_worker_finishes() {
+        let mut app = test_app();
+        let (tx_start, rx_start) = mpsc::channel::<()>();
+        let (tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+
+        let worker = std::thread::spawn(move || {
+            let _ = rx_start.recv();
+            let _ = tx_result.send(Ok(42));
+        });
+
+        app.pending_copy = Some(PendingCopy {
+            name: "alpha".to_string(),
+            started_at: Instant::now(),
+            rx: rx_result,
+            worker: Some(worker),
+        });
+
+        app.drain_pending_copy(false);
+        assert!(app.pending_copy.is_some());
+
+        tx_start.send(()).expect("start copy");
+        app.drain_pending_copy(true);
+
+        assert!(app.pending_copy.is_none());
+        let status = app
+            .status_line
+            .as_ref()
+            .map(|(msg, _)| msg.as_str())
+            .unwrap_or("");
+        assert!(status.contains("Copied last assistant output"));
+    }
+
+    #[test]
+    fn modal_prioritizes_export_prompt_over_copy_overlay() {
+        let mut app = test_app();
+        let (_tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+
+        app.pending_copy = Some(PendingCopy {
+            name: "alpha".to_string(),
+            started_at: Instant::now(),
+            rx: rx_result,
+            worker: None,
+        });
+        app.pending_export = Some(PendingExport {
+            name: "alpha".to_string(),
+            when: Instant::now() + Duration::from_secs(2),
+        });
+
+        let (title, _) = modal_content(&app).expect("modal visible");
+        assert_eq!(title, "Export Markdown");
+    }
+
+    #[test]
+    fn modal_prioritizes_delete_prompt_over_copy_overlay() {
+        let mut app = test_app();
+        let (_tx_result, rx_result) = mpsc::channel::<Result<usize, String>>();
+
+        app.pending_copy = Some(PendingCopy {
+            name: "alpha".to_string(),
+            started_at: Instant::now(),
+            rx: rx_result,
+            worker: None,
+        });
+        app.pending_delete = Some(PendingDelete {
+            name: "alpha".to_string(),
+            when: Instant::now() + Duration::from_secs(2),
+        });
+
+        let (title, _) = modal_content(&app).expect("modal visible");
+        assert_eq!(title, "Confirm Delete");
     }
 
     #[test]
