@@ -88,6 +88,7 @@ br
 - `F8` / `Ctrl+X`: kill selected session (with confirmation)
 - `F9`: force-kill selected session
 - `Ctrl+S`: open export mode chooser
+- `Ctrl+Shift+C`: copy last assistant output from selected chat to clipboard
 - `q`: quit
 
 ## Exporter (`cx`)

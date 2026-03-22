@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Stdout};
+use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -928,6 +928,122 @@ fn export_code_dir() -> PathBuf {
     code
 }
 
+fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {}", program, e))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("{} stdin: {}", program, e))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{} wait: {}", program, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("{} exited with {}", program, output.status))
+    } else {
+        Err(format!("{}: {}", program, stderr))
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        for (program, args) in [
+            ("clip", Vec::<&str>::new()),
+            (
+                "powershell",
+                vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Set-Clipboard"],
+            ),
+        ] {
+            match run_clipboard_command(program, &args, text) {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(err),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match run_clipboard_command("pbcopy", &[], text) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(err),
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for (program, args) in [
+            ("wl-copy", vec![]),
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+        ] {
+            match run_clipboard_command(program, &args, text) {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(err),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Err("No clipboard integration available on this platform".to_string())
+    } else {
+        Err(errors.join(" | "))
+    }
+}
+
+fn copy_last_assistant_output(app: &mut App, name: &str) {
+    let Some(session_id) = coder_session_id_for_tmux_session(name) else {
+        app.set_status_for(
+            format!("No coder session id found for '{}'", name),
+            Duration::from_millis(1800),
+        );
+        return;
+    };
+
+    let code_dir = export_code_dir();
+    match exporter::latest_assistant_output_for_session(&session_id, &code_dir) {
+        Ok(text) => match copy_text_to_clipboard(&text) {
+            Ok(()) => {
+                app.set_status_for(
+                    format!(
+                        "Copied last assistant output from '{}' ({} chars)",
+                        name,
+                        text.chars().count()
+                    ),
+                    Duration::from_secs(2),
+                );
+            }
+            Err(err) => {
+                app.set_status_for(
+                    format!("Clipboard copy failed: {}", ellipsize(&err, 140)),
+                    Duration::from_secs(3),
+                );
+            }
+        },
+        Err(err) => {
+            app.set_status_for(
+                format!("Copy failed: {}", ellipsize(&err, 140)),
+                Duration::from_secs(3),
+            );
+        }
+    }
+}
+
 fn start_export_prompt(app: &mut App) {
     let Some(name) = app.selected_name().map(|s| s.to_string()) else {
         app.set_status_for("No session selected", Duration::from_millis(1000));
@@ -1805,6 +1921,18 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
         }
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+            app.set_status_for("No session selected", Duration::from_millis(1000));
+            return None;
+        };
+        copy_last_assistant_output(app, &name);
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => return Some(None),
@@ -2230,7 +2358,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2585,6 +2713,19 @@ mod tests {
 
         let _ = handle_filter_mode(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pending_export.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_c_triggers_copy_instead_of_quit() {
+        let mut app = test_app();
+
+        let action = handle_filter_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+
+        assert!(action.is_none());
+        assert!(app.status_line.is_some());
     }
 
     #[test]

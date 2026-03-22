@@ -14,6 +14,46 @@ pub enum ExportMode {
     Json,
 }
 
+pub fn latest_assistant_output_for_session(
+    session_id: &str,
+    code_dir: &Path,
+) -> Result<String, String> {
+    let rollout = rollout_path_for_session(session_id, code_dir)?;
+    let file = File::open(&rollout)
+        .map_err(|e| format!("failed to open {}: {}", rollout.display(), e))?;
+    let reader = BufReader::new(file);
+    let mut last_assistant: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let obj: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+
+        let Some(payload) = obj.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        if payload.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+
+        if let Some(text) = assistant_text_from_content(payload.get("content")) {
+            if !text.trim().is_empty() {
+                last_assistant = Some(text);
+            }
+        }
+    }
+
+    last_assistant.ok_or_else(|| format!("No assistant output found for session {}", session_id))
+}
+
 #[derive(Clone, Debug)]
 struct MediumToolCall {
     name: String,
@@ -243,6 +283,44 @@ fn resolve_output_path(session_id: &str, out_path: &Path) -> Result<PathBuf, Str
     fs::create_dir_all(out_path)
         .map_err(|e| format!("failed to create {}: {}", out_path.display(), e))?;
     Ok(out_path.join(format!("{}.md", session_id)))
+}
+
+fn assistant_text_from_content(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+
+    if let Some(text) = content.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+        return None;
+    }
+
+    if let Some(parts) = content.as_array() {
+        let mut out: Vec<String> = Vec::new();
+        for part in parts {
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            match kind {
+                "output_text" | "text" | "input_text" => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        let t = text.trim();
+                        if !t.is_empty() {
+                            out.push(t.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out.is_empty() {
+            return Some(out.join("\n"));
+        }
+    }
+
+    None
 }
 
 fn rollout_path_for_session(session_id: &str, code_dir: &Path) -> Result<PathBuf, String> {
@@ -1881,6 +1959,112 @@ mod tests {
             .expect("exported");
         let body = fs::read_to_string(&out_file).expect("read output");
         assert!(body.contains("hello from stale-catalog fallback"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_assistant_output_uses_last_assistant_message() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-last-assistant-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "eeeeeeee-ffff-0000-1111-222222222222";
+        let rollout_rel = format!("sessions/2026/03/18/rollout-{}.jsonl", session_id);
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let assistant_a = serde_json::json!({
+            "timestamp": "2026-03-18T10:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "first"}]
+            }
+        });
+        let user = serde_json::json!({
+            "timestamp": "2026-03-18T10:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ignore"}]
+            }
+        });
+        let assistant_b = serde_json::json!({
+            "timestamp": "2026-03-18T10:00:03.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "second"}]
+            }
+        });
+        fs::write(
+            &rollout_path,
+            format!("{}\n{}\n{}\n", assistant_a, user, assistant_b),
+        )
+        .expect("rollout write");
+
+        let text = latest_assistant_output_for_session(session_id, &code_dir).expect("assistant output");
+        assert_eq!(text, "second");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_assistant_output_errors_when_no_assistant_message_exists() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("b-revamp-export-last-assistant-empty-{}", uniq));
+        let code_dir = root.join(".code");
+        let catalog_dir = code_dir.join("sessions/index");
+        let rollout_dir = code_dir.join("sessions/2026/03/18");
+        fs::create_dir_all(&catalog_dir).expect("catalog dir");
+        fs::create_dir_all(&rollout_dir).expect("rollout dir");
+
+        let session_id = "ffffffff-0000-1111-2222-333333333333";
+        let rollout_rel = format!("sessions/2026/03/18/rollout-{}.jsonl", session_id);
+        let rollout_path = code_dir.join(&rollout_rel);
+
+        let catalog_line = serde_json::json!({
+            "session_id": session_id,
+            "rollout_path": rollout_rel,
+            "deleted": false
+        })
+        .to_string();
+        fs::write(catalog_dir.join("catalog.jsonl"), format!("{}\n", catalog_line)).expect("catalog write");
+
+        let user = serde_json::json!({
+            "timestamp": "2026-03-18T10:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "only user"}]
+            }
+        });
+        fs::write(&rollout_path, format!("{}\n", user)).expect("rollout write");
+
+        let err = latest_assistant_output_for_session(session_id, &code_dir).expect_err("expected error");
+        assert!(err.contains("No assistant output found"));
 
         let _ = fs::remove_dir_all(&root);
     }
