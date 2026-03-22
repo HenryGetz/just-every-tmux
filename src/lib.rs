@@ -1958,14 +1958,7 @@ fn handle_filter_mode(app: &mut App, key: KeyEvent) -> Option<Option<String>> {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                let Some(name) = app.selected_name().map(|s| s.to_string()) else {
-                    app.set_status_for("No session selected", Duration::from_millis(1000));
-                    return None;
-                };
-                copy_last_assistant_output(app, &name);
-                return None;
-            }
+            KeyCode::Char('c') | KeyCode::Char('C') => return Some(None),
             KeyCode::Char('q') | KeyCode::Char('Q') => return Some(None),
             KeyCode::Char('j') => {
                 app.step_preview_pane(1);
@@ -2397,7 +2390,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(help_1, chunks[1]);
 
     let help_2_text = if app.show_help {
-        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C/Ctrl+C/F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
+        "Type filter  / fresh-search  Backspace + y/n delete  Ctrl+S export-md chooser  Ctrl+Shift+C/F10 copy last AI output  Ctrl+W word-del  Ctrl+U clear  Ctrl+O open/create  Ctrl+J/K pane  Ctrl+Y pane-kill  Ctrl+X/F8 kill  F9 force"
     } else {
         ""
     };
@@ -2778,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_triggers_copy_in_filter_mode() {
+    fn ctrl_c_quits_in_filter_mode() {
         let mut app = test_app();
 
         let action = handle_filter_mode(
@@ -2786,8 +2779,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
 
-        assert!(action.is_none());
-        assert!(app.status_line.is_some());
+        assert!(matches!(action, Some(None)));
     }
 
     #[test]
