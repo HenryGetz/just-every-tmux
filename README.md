@@ -122,8 +122,8 @@ Default output directory for exports is `~/coder-md`.
 
 ## Environment Variables
 
-- `BR_RUN_CMD`: startup command sent to tmux (default: `coder` for worktree mode; `b` sessions default to `opencode attach <url> --dir <dir>`; supports `{name}`, `{dir}`, `{url}` substitution). In `b` (CWD) mode a bare `opencode` value is treated as the attach default; set another command (e.g. `coder`) to run something else.
-- `BR_SERVER_URL`: opencode server URL used by `b` sessions (default: `http://127.0.0.1:4096`). If `OPENCODE_SERVER_PASSWORD` is set in your environment, both the spawned server and the attach commands inherit it consistently.
+- `BR_RUN_CMD`: startup command sent to tmux (default: `coder` for worktree mode; `b` sessions default to `opencode attach <url> --dir <dir>`; supports `{name}`, `{dir}`, `{url}` substitution). In `b` (CWD) mode a bare `opencode` value is treated as the attach default; set another command (e.g. `coder`) to run something else. To run standalone (non-attached) opencode in a `b` session, set `BR_RUN_CMD` to anything other than exactly `opencode` (e.g. `BR_RUN_CMD='opencode --print-logs'`).
+- `BR_SERVER_URL`: opencode server URL used by `b` sessions (default: `http://127.0.0.1:4096`). If `OPENCODE_SERVER_PASSWORD` is set in your environment, both the spawned server and the attach commands inherit it consistently. If another HTTP server is already squatting on the configured port, `b --server-status` may report "up" while attach fails; check `~/.local/state/b/serve.log` and pick a different port via `BR_SERVER_URL`.
 - `BR_PREFIX`: branch prefix (default: `w/`)
 - `BR_BASE`: base ref for new branches (default: `origin/main`)
 - `BR_WORKTREES_DIR`: worktree directory (default: `~/.br`)

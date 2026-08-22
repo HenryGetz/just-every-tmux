@@ -1533,6 +1533,7 @@ fn server_reachable(url: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
         return false;
     };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
     let req = format!("GET /doc HTTP/1.0\r\nHost: {}\r\n\r\n", host);
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
@@ -1572,7 +1573,8 @@ fn spawn_server(url: &str) -> BrResult<()> {
     }
     let log_out = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)
         .map_err(|err| {
             ExitError::new(
@@ -1586,7 +1588,8 @@ fn spawn_server(url: &str) -> BrResult<()> {
         })?;
     let log_err = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)
         .map_err(|err| {
             ExitError::new(
