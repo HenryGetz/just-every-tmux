@@ -80,6 +80,8 @@ b notes
 br
 ```
 
+`b <name>` connects the new tmux pane to one shared opencode server (`opencode serve`, auto-started detached on first use) instead of launching a fresh opencode/coder TUI per session. Every `b <name>` pane attaches to the same server, each in its own directory, so you get per-folder sessions without one server per session. Check the server with `b --server-status`; its log lives at `${XDG_STATE_HOME:-~/.local/state}/b/serve.log`. Worktree mode (`br`) keeps `coder` as the startup command.
+
 ## TUI Keys
 
 - `Enter` / `Space`: open selected session
@@ -120,7 +122,8 @@ Default output directory for exports is `~/coder-md`.
 
 ## Environment Variables
 
-- `BR_RUN_CMD`: startup command sent to tmux (default: `coder`)
+- `BR_RUN_CMD`: startup command sent to tmux (default: `coder` for worktree mode; `b` sessions default to `opencode attach <url> --dir <dir>`; supports `{name}`, `{dir}`, `{url}` substitution). In `b` (CWD) mode a bare `opencode` value is treated as the attach default; set another command (e.g. `coder`) to run something else.
+- `BR_SERVER_URL`: opencode server URL used by `b` sessions (default: `http://127.0.0.1:4096`). If `OPENCODE_SERVER_PASSWORD` is set in your environment, both the spawned server and the attach commands inherit it consistently.
 - `BR_PREFIX`: branch prefix (default: `w/`)
 - `BR_BASE`: base ref for new branches (default: `origin/main`)
 - `BR_WORKTREES_DIR`: worktree directory (default: `~/.br`)
@@ -129,6 +132,10 @@ Default output directory for exports is `~/coder-md`.
 - `BR_MODE`: force mode (`worktree` or `cwd`)
 - `BR_EXPORT_OUT`: export directory for `Ctrl+S` (default: `~/coder-md`)
 - `BR_CODE_DIR`: code data dir for exports (default: `~/.code`)
+
+## Notes
+
+- Copy (`Ctrl+P` / picker) and export (`Ctrl+S` / `cx`) resolve sessions from coder's `~/.code` session files, so they apply to coder/worktree sessions. Sessions created via `b <name>` attach to a shared opencode server and have no coder session files; use worktree mode (`br`) for sessions you want to copy/export from.
 
 ## Development
 

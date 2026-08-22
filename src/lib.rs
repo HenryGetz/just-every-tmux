@@ -1674,12 +1674,21 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn render_start_cmd(name: &str, mode: Mode, target_dir: &Path) -> String {
-    if let Ok(template) = env::var("BR_RUN_CMD") {
-        let mut vars = HashMap::new();
-        vars.insert("name".to_string(), name.to_string());
-        vars.insert("dir".to_string(), target_dir.display().to_string());
-        vars.insert("url".to_string(), server_url());
-        return strfmt(&template, &vars).unwrap_or(template);
+    let bare_opencode_override = env::var("BR_RUN_CMD")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .is_some_and(|t| t == "opencode");
+    // A bare "opencode" BR_RUN_CMD restates the old default; in Cwd mode
+    // collapse it to the shared-server attach command. Worktree mode keeps
+    // the standalone opencode launcher.
+    if !(mode == Mode::Cwd && bare_opencode_override) {
+        if let Ok(template) = env::var("BR_RUN_CMD") {
+            let mut vars = HashMap::new();
+            vars.insert("name".to_string(), name.to_string());
+            vars.insert("dir".to_string(), target_dir.display().to_string());
+            vars.insert("url".to_string(), server_url());
+            return strfmt(&template, &vars).unwrap_or(template);
+        }
     }
 
     match mode {
@@ -4465,5 +4474,17 @@ mod tests {
         let cmd = render_start_cmd("sess", Mode::Cwd, Path::new("/tmp/x"));
         env::remove_var("BR_RUN_CMD");
         assert_eq!(cmd, "echo sess /tmp/x");
+    }
+
+    #[test]
+    fn render_cwd_mode_collapses_bare_opencode_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("BR_RUN_CMD", "opencode");
+        let cwd = render_start_cmd("sess", Mode::Cwd, Path::new("/tmp/x y"));
+        assert!(cwd.contains("opencode attach"));
+        assert!(cwd.contains("--dir '"));
+        let worktree = render_start_cmd("sess", Mode::Worktree, Path::new("/tmp/x"));
+        assert_eq!(worktree, "opencode");
+        env::remove_var("BR_RUN_CMD");
     }
 }
