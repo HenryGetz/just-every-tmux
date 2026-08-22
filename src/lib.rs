@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Stdout, Write};
+use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -48,21 +49,26 @@ New in this version:
   • TUI shows each session's "Last" time (most recent of: last-attached, activity, created)
   • Sessions auto-sort by most recent first; fuzzy results rank by match, then recency
   • `br --list` prints sessions sorted by recency (names only)
+  • `b <name>` (CWD mode) attaches panes to a shared opencode server instead of "coder"
 
 Modes:
   br <name>  => worktree mode (real Git worktree under ~/.br/w-<name>, branch w/<name>)
-  b  <name>  => CWD mode     (no worktree; just open tmux in current dir)
+  b  <name>  => CWD mode     (no worktree; tmux in current dir, attach to shared opencode server)
 
 Usage:
   br <session-name>     # create/attach worktree+branch, tmux there, run coder
-  b  <session-name>     # create/attach tmux in CWD, run coder (no Git)
+  b  <session-name>     # create/attach tmux in CWD, attach to shared opencode server (no Git)
   br --list             # list tmux sessions (no TUI)
+  b  --server-status    # print whether the opencode server is up (no side effects)
   br -h | --help        # help
   br                    # TUI: fuzzy-filter; Enter/Space to open (uses this tool's mode)
   b                     # same TUI, but new sessions use CWD mode
 
 Env (all optional):
-  BR_RUN_CMD        startup command sent to tmux (default: "coder")
+  BR_RUN_CMD        startup command sent to tmux (default: "coder" for worktree mode;
+                    CWD mode defaults to "opencode attach <url> --dir <dir>"; this env
+                    overrides that; {name}, {dir}, {url} are substituted)
+  BR_SERVER_URL     opencode server URL (default: "http://127.0.0.1:4096")
   BR_PREFIX         branch prefix (default: "w/")
   BR_BASE           base ref for new branches (STRICT; default: "origin/main")
   BR_WORKTREES_DIR  directory for worktrees (default: "~/.br")
@@ -73,6 +79,9 @@ Env (all optional):
 Notes:
   • Session names are auto-normalized: invalid characters are replaced with "_".
     Allowed characters are: letters, digits, . _ : -
+  • Every `b <name>` pane attaches to the same opencode server (each in its own
+    directory). Copy/export operate on "coder" sessions, so use worktree mode (`br`)
+    for sessions you want to copy/export from.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -609,6 +618,12 @@ fn run_inner() -> BrResult<i32> {
             for name in list_sessions()? {
                 println!("{}", name);
             }
+            return Ok(0);
+        }
+        if arg == "--server-status" {
+            let url = server_url();
+            let status = if server_reachable(&url) { "up" } else { "down" };
+            println!("opencode server: {} at {}", status, url);
             return Ok(0);
         }
 
@@ -1251,8 +1266,12 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
 }
 
 fn copy_assistant_output_result(name: &str, target: CopyTarget) -> Result<CopiedOutput, String> {
-    let session_id = coder_session_id_for_tmux_session(name)
-        .ok_or_else(|| format!("No coder session id found for '{}'", name))?;
+    let session_id = coder_session_id_for_tmux_session(name).ok_or_else(|| {
+        format!(
+            "No coder session id found for '{}' (copy/export target coder sessions; sessions created via `b <name>` attach to a shared opencode server)",
+            name
+        )
+    })?;
     let code_dir = export_code_dir();
     let text = exporter::assistant_output_from_end_for_session(
         &session_id,
@@ -1332,7 +1351,10 @@ fn export_session_markdown(app: &mut App, name: &str, depth: ExportDepth) {
 
     let Some(session_id) = coder_session_id_for_tmux_session(name) else {
         app.set_status_for(
-            format!("No coder session id found for '{}'", name),
+            format!(
+                "No coder session id found for '{}' (copy/export target coder sessions; sessions created via `b <name>` attach to a shared opencode server)",
+                name
+            ),
             Duration::from_millis(1800),
         );
         return;
@@ -1450,21 +1472,232 @@ fn session_preview_data(name: &str, selected_pane: Option<&str>) -> BrResult<Ses
     })
 }
 
-fn render_start_cmd(name: &str) -> String {
-    let template = env::var("BR_RUN_CMD").unwrap_or_else(|_| "coder".to_string());
-    let mut vars = HashMap::new();
-    vars.insert("name".to_string(), name.to_string());
-    strfmt(&template, &vars).unwrap_or(template)
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
+
+fn server_url() -> String {
+    env::var("BR_SERVER_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
 }
 
-fn send_start_cmd(name: &str) -> BrResult<()> {
+fn server_host_port(url: &str) -> (String, u16) {
+    let mut rest = url.trim();
+    for prefix in ["http://", "https://"] {
+        if let Some(s) = rest.strip_prefix(prefix) {
+            rest = s;
+            break;
+        }
+    }
+    // Drop any path/query: keep only the scheme-less host[:port] part.
+    let rest = rest.split('/').next().unwrap_or("");
+    // Normalize IPv6 bracket form: "[::1]:4096" -> "::1:4096".
+    let rest = match rest.strip_prefix('[') {
+        Some(inner) => match inner.split_once(']') {
+            Some((host_part, tail)) => format!("{}{}", host_part, tail),
+            None => rest.to_string(),
+        },
+        None => rest.to_string(),
+    };
+    let rest = rest.as_str();
+    // Drop a lone trailing colon ("http://host:").
+    let rest = rest.trim_end_matches(':');
+    match rest.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h.to_string(), p.parse().unwrap_or(4096)),
+        _ => {
+            if rest.is_empty() {
+                ("127.0.0.1".to_string(), 4096)
+            } else {
+                (rest.to_string(), 4096)
+            }
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+fn server_reachable(url: &str) -> bool {
+    let (host, port) = server_host_port(url);
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.into_iter().next() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    let req = format!("GET /doc HTTP/1.0\r\nHost: {}\r\n\r\n", host);
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut buf = [0u8; 512];
+    let Ok(n) = stream.read(&mut buf) else {
+        return false;
+    };
+    buf[..n].starts_with(b"HTTP/")
+}
+
+fn server_log_path() -> PathBuf {
+    let state = env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| expand_path(&v))
+        .unwrap_or_else(|| expand_path("~/.local/state"));
+    state.join("b").join("serve.log")
+}
+
+fn spawn_server(url: &str) -> BrResult<()> {
+    let (host, port) = server_host_port(url);
+
+    let log_path = server_log_path();
+    if let Some(dir) = log_path.parent() {
+        fs::create_dir_all(dir).map_err(|err| {
+            ExitError::new(
+                1,
+                format!(
+                    "[br] failed to create server log dir {}: {}\n",
+                    dir.display(),
+                    err
+                ),
+            )
+        })?;
+    }
+    let log_out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|err| {
+            ExitError::new(
+                1,
+                format!(
+                    "[br] failed to open server log {}: {}\n",
+                    log_path.display(),
+                    err
+                ),
+            )
+        })?;
+    let log_err = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|err| {
+            ExitError::new(
+                1,
+                format!(
+                    "[br] failed to open server log {}: {}\n",
+                    log_path.display(),
+                    err
+                ),
+            )
+        })?;
+
+    let binary = which("opencode").map_err(|_| {
+        ExitError::new(
+            1,
+            "Error: opencode not found in PATH; needed to start the attach server.\n",
+        )
+    })?;
+
+    let home = home_dir_string().unwrap_or_else(|| ".".to_string());
+    let mut cmd = Command::new(binary);
+    cmd.args(["serve", "--hostname", &host, "--port", &port.to_string()])
+        .current_dir(&home)
+        .stdout(log_out)
+        .stderr(log_err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let _ = cmd.spawn().map_err(|err| {
+        ExitError::new(
+            1,
+            format!(
+                "Error: failed to start opencode server: {} (log: {})\n",
+                err,
+                log_path.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_server(url: &str) -> BrResult<()> {
+    let (host, _port) = server_host_port(url);
+    if !is_loopback_host(&host) {
+        if server_reachable(url) {
+            return Ok(());
+        }
+        return Err(ExitError::new(
+            1,
+            format!(
+                "Error: opencode server at {} is unreachable and not a loopback address; refusing to start it.\n",
+                url
+            ),
+        ));
+    }
+
+    if server_reachable(url) {
+        return Ok(());
+    }
+    spawn_server(url)?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if server_reachable(url) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    Err(ExitError::new(
+        1,
+        format!(
+            "Error: opencode server at {} did not come up; log: {} — check it, or set BR_SERVER_URL.\n",
+            url,
+            server_log_path().display()
+        ),
+    ))
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn render_start_cmd(name: &str, mode: Mode, target_dir: &Path) -> String {
+    if let Ok(template) = env::var("BR_RUN_CMD") {
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), name.to_string());
+        vars.insert("dir".to_string(), target_dir.display().to_string());
+        vars.insert("url".to_string(), server_url());
+        return strfmt(&template, &vars).unwrap_or(template);
+    }
+
+    match mode {
+        Mode::Cwd => {
+            let quoted = shell_quote(&target_dir.display().to_string());
+            format!("opencode attach {} --dir {}", server_url(), quoted)
+        }
+        Mode::Worktree => "coder".to_string(),
+    }
+}
+
+fn send_start_cmd(name: &str, cmd: &str) -> BrResult<()> {
     let tmux = tmux_path()?;
-    let cmd = render_start_cmd(name);
     let args = vec![
         "send-keys".to_string(),
         "-t".to_string(),
         name.to_string(),
-        cmd,
+        cmd.to_string(),
         "C-m".to_string(),
     ];
     let _ = run_status(tmux, &args, None)?;
@@ -1752,6 +1985,12 @@ fn create_session_if_needed(name: &str, mode: Mode) -> BrResult<()> {
             ExitError::new(1, format!("[br] failed to get current dir: {}\n", err))
         })?,
     };
+    let target_dir = fs::canonicalize(&target_dir).unwrap_or(target_dir);
+
+    let start_cmd = render_start_cmd(name, mode, &target_dir);
+    if start_cmd.contains("opencode attach") {
+        ensure_server(&server_url())?;
+    }
 
     let tmux = tmux_path()?;
     let args = vec![
@@ -1770,7 +2009,7 @@ fn create_session_if_needed(name: &str, mode: Mode) -> BrResult<()> {
         ));
     }
 
-    send_start_cmd(name)?;
+    send_start_cmd(name, &start_cmd)?;
     Ok(())
 }
 
@@ -3379,7 +3618,9 @@ fn tui(_mode: Mode) -> BrResult<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
+    use std::path::Path;
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3388,11 +3629,15 @@ mod tests {
     use super::{
         desired_sessions_panel_width, extract_session_id_from_path, fuzzy_score, handle_filter_mode,
         handle_new_session_mode, handle_rename_session_mode, is_copy_picker_shortcut,
-        modal_content, normalize_session_name, parse_tmux_session_line, paths_match,
-        rename_session_args, session_ids_from_cwd_in, wrapped_visual_line_count, App,
-        CopiedOutput, CopyPreview, CopyTarget, InputMode, PendingCopy, PendingDelete,
+        is_loopback_host, modal_content, normalize_session_name, parse_tmux_session_line,
+        paths_match, render_start_cmd, rename_session_args, server_host_port,
+        server_url, session_ids_from_cwd_in, shell_quote, wrapped_visual_line_count, App,
+        CopiedOutput, CopyPreview, CopyTarget, InputMode, Mode, PendingCopy, PendingDelete,
         PendingExport, SessionInfo,
     };
+
+    // Serializes tests that read/write process-wide env vars (BR_RUN_CMD).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_app() -> App {
         let mut app = App {
@@ -4143,5 +4388,82 @@ mod tests {
         assert_eq!(parsed.last_attached, 0);
         assert_eq!(parsed.activity, 0);
         assert_eq!(parsed.created, 0);
+    }
+
+    #[test]
+    fn server_host_port_parses_scheme_host_and_port() {
+        assert_eq!(
+            server_host_port("http://127.0.0.1:4096"),
+            ("127.0.0.1".to_string(), 4096)
+        );
+        assert_eq!(
+            server_host_port("http://localhost:9000/"),
+            ("localhost".to_string(), 9000)
+        );
+        assert_eq!(server_host_port("bogus"), ("bogus".to_string(), 4096));
+        assert_eq!(
+            server_host_port("https://example.com:1234"),
+            ("example.com".to_string(), 1234)
+        );
+        assert_eq!(
+            server_host_port("http://myserver"),
+            ("myserver".to_string(), 4096)
+        );
+        assert_eq!(
+            server_host_port("http://example.com:8080/path"),
+            ("example.com".to_string(), 8080)
+        );
+        assert_eq!(server_host_port("http://[::1]:4096"), ("::1".to_string(), 4096));
+        assert_eq!(server_host_port(""), ("127.0.0.1".to_string(), 4096));
+        assert_eq!(server_host_port("http://host:"), ("host".to_string(), 4096));
+        assert_eq!(
+            server_host_port("http://host:notaport"),
+            ("host".to_string(), 4096)
+        );
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(!is_loopback_host("192.168.1.5"));
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote("abc"), "'abc'");
+    }
+
+    #[test]
+    fn render_cwd_mode_attaches_to_shared_server() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("BR_RUN_CMD");
+        let cmd = render_start_cmd("sess", Mode::Cwd, Path::new("/tmp/x y"));
+        assert!(cmd.contains("opencode attach"));
+        assert!(cmd.contains("--dir '/tmp/x y'"));
+        assert!(cmd.contains(&server_url()));
+    }
+
+    #[test]
+    fn render_worktree_mode_uses_coder_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("BR_RUN_CMD");
+        assert_eq!(
+            render_start_cmd("sess", Mode::Worktree, Path::new("/tmp/x")),
+            "coder"
+        );
+    }
+
+    #[test]
+    fn render_start_cmd_applies_br_run_cmd_template() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("BR_RUN_CMD", "echo {name} {dir}");
+        let cmd = render_start_cmd("sess", Mode::Cwd, Path::new("/tmp/x"));
+        env::remove_var("BR_RUN_CMD");
+        assert_eq!(cmd, "echo sess /tmp/x");
     }
 }
