@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,6 +82,9 @@ Notes:
   • Every `b <name>` pane attaches to the same opencode server (each in its own
     directory). Copy/export operate on "coder" sessions, so use worktree mode (`br`)
     for sessions you want to copy/export from.
+  • `b` starts the opencode server only when nothing is listening on BR_SERVER_URL;
+    if the port is already taken it warns and attaches instead of starting a
+    second server.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -704,6 +707,22 @@ fn run_capture(program: &str, args: &[String], cwd: Option<&Path>) -> BrResult<C
 }
 
 fn run_status(program: &str, args: &[String], cwd: Option<&Path>) -> BrResult<i32> {
+    run_status_inner(program, args, cwd, false)
+}
+
+/// Like `run_status`, but swallows the child's stderr. For expectation-probing
+/// calls such as `tmux has-session`, whose "can't find session: X" is the
+/// normal negative answer rather than something to print.
+fn run_status_quiet(program: &str, args: &[String], cwd: Option<&Path>) -> BrResult<i32> {
+    run_status_inner(program, args, cwd, true)
+}
+
+fn run_status_inner(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    quiet: bool,
+) -> BrResult<i32> {
     if verbose_enabled() {
         let cwd_txt = cwd
             .map(|p| p.display().to_string())
@@ -717,6 +736,9 @@ fn run_status(program: &str, args: &[String], cwd: Option<&Path>) -> BrResult<i3
         cmd.current_dir(dir);
     }
     cmd.stdin(Stdio::null());
+    if quiet {
+        cmd.stderr(Stdio::null());
+    }
 
     let status = cmd.status().map_err(|err| {
         ExitError::new(
@@ -806,7 +828,7 @@ fn list_sessions() -> BrResult<Vec<String>> {
 fn session_exists(name: &str) -> BrResult<bool> {
     let tmux = tmux_path()?;
     let args = vec!["has-session".to_string(), "-t".to_string(), name.to_string()];
-    let code = run_status(tmux, &args, None)?;
+    let code = run_status_quiet(tmux, &args, None)?;
     Ok(code == 0)
 }
 
@@ -1546,6 +1568,20 @@ fn server_reachable(url: &str) -> bool {
     buf[..n].starts_with(b"HTTP/")
 }
 
+/// True when something is listening on the URL's host:port, regardless of
+/// whether it answers HTTP. Distinguishes "no server" (safe to start one) from
+/// "port taken" (starting one can only fail).
+fn server_port_open(url: &str) -> bool {
+    let (host, port) = server_host_port(url);
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.into_iter().next() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
 fn server_log_path() -> PathBuf {
     let state = env::var("XDG_STATE_HOME")
         .ok()
@@ -1555,7 +1591,44 @@ fn server_log_path() -> PathBuf {
     state.join("b").join("serve.log")
 }
 
-fn spawn_server(url: &str) -> BrResult<()> {
+/// Drop ANSI CSI sequences; opencode colors its startup errors even when they
+/// are redirected to the log file.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for c in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Last few non-empty lines of the serve log, for startup failure messages.
+fn server_log_tail() -> String {
+    const MAX_LINES: usize = 12;
+    let Ok(raw) = fs::read_to_string(server_log_path()) else {
+        return String::new();
+    };
+    let text = strip_ansi(&raw);
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(MAX_LINES);
+    if start >= lines.len() {
+        return String::new();
+    }
+    format!("{}\n", lines[start..].join("\n"))
+}
+
+fn spawn_server(url: &str) -> BrResult<Child> {
     let (host, port) = server_host_port(url);
 
     let log_path = server_log_path();
@@ -1586,21 +1659,16 @@ fn spawn_server(url: &str) -> BrResult<()> {
                 ),
             )
         })?;
-    let log_err = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .map_err(|err| {
-            ExitError::new(
-                1,
-                format!(
-                    "[br] failed to open server log {}: {}\n",
-                    log_path.display(),
-                    err
-                ),
-            )
-        })?;
+    let log_err = log_out.try_clone().map_err(|err| {
+        ExitError::new(
+            1,
+            format!(
+                "[br] failed to open server log {}: {}\n",
+                log_path.display(),
+                err
+            ),
+        )
+    })?;
 
     let binary = which("opencode").map_err(|_| {
         ExitError::new(
@@ -1621,7 +1689,7 @@ fn spawn_server(url: &str) -> BrResult<()> {
         cmd.process_group(0);
     }
 
-    let _ = cmd.spawn().map_err(|err| {
+    let child = cmd.spawn().map_err(|err| {
         ExitError::new(
             1,
             format!(
@@ -1631,11 +1699,11 @@ fn spawn_server(url: &str) -> BrResult<()> {
             ),
         )
     })?;
-    Ok(())
+    Ok(child)
 }
 
 fn ensure_server(url: &str) -> BrResult<()> {
-    let (host, _port) = server_host_port(url);
+    let (host, port) = server_host_port(url);
     if !is_loopback_host(&host) {
         if server_reachable(url) {
             return Ok(());
@@ -1652,24 +1720,58 @@ fn ensure_server(url: &str) -> BrResult<()> {
     if server_reachable(url) {
         return Ok(());
     }
-    spawn_server(url)?;
+
+    // A failed probe on a port that something already holds is not a dead
+    // server: either a loaded opencode missed the probe or another process owns
+    // the port. Spawning a second server there can only fail (opencode exits
+    // with ServeError on the taken port), so re-probe briefly and then let
+    // attach report the truth instead of burning the startup deadline.
+    if server_port_open(url) {
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_millis(350));
+            if server_reachable(url) {
+                return Ok(());
+            }
+        }
+        eprintln!(
+            "Warning: {}:{} is already in use but did not answer the opencode probe; not starting a second server (check the process on that port, or set BR_SERVER_URL).\n",
+            host, port
+        );
+        return Ok(());
+    }
+
+    let mut child = spawn_server(url)?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    loop {
         if server_reachable(url) {
             return Ok(());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(ExitError::new(
+                1,
+                format!(
+                    "Error: opencode server at {} exited during startup ({}) — {}:\n{}",
+                    url,
+                    status,
+                    server_log_path().display(),
+                    server_log_tail()
+                ),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(ExitError::new(
+                1,
+                format!(
+                    "Error: opencode server at {} did not come up; log: {} — check it, or set BR_SERVER_URL.\n{}",
+                    url,
+                    server_log_path().display(),
+                    server_log_tail()
+                ),
+            ));
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    Err(ExitError::new(
-        1,
-        format!(
-            "Error: opencode server at {} did not come up; log: {} — check it, or set BR_SERVER_URL.\n",
-            url,
-            server_log_path().display()
-        ),
-    ))
 }
 
 fn shell_quote(s: &str) -> String {
@@ -3643,7 +3745,8 @@ mod tests {
         handle_new_session_mode, handle_rename_session_mode, is_copy_picker_shortcut,
         is_loopback_host, modal_content, normalize_session_name, parse_tmux_session_line,
         paths_match, render_start_cmd, rename_session_args, server_host_port,
-        server_url, session_ids_from_cwd_in, shell_quote, wrapped_visual_line_count, App,
+        server_port_open, server_reachable, server_url, session_ids_from_cwd_in, shell_quote,
+        strip_ansi, wrapped_visual_line_count, App,
         CopiedOutput, CopyPreview, CopyTarget, InputMode, Mode, PendingCopy, PendingDelete,
         PendingExport, SessionInfo,
     };
@@ -4489,5 +4592,38 @@ mod tests {
         let worktree = render_start_cmd("sess", Mode::Worktree, Path::new("/tmp/x"));
         assert_eq!(worktree, "opencode");
         env::remove_var("BR_RUN_CMD");
+    }
+
+    #[test]
+    fn occupied_port_that_never_answers_http_is_still_occupied() {
+        // Stands in for a loaded or unrelated process on the configured port:
+        // the HTTP probe fails, but the port is taken, so ensure_server must
+        // not try to start a second server there.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{}:{}", addr.ip(), addr.port());
+
+        assert!(server_port_open(&url));
+        assert!(!server_reachable(&url));
+    }
+
+    #[test]
+    fn released_port_is_reported_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{}:{}", addr.ip(), addr.port());
+        drop(listener);
+
+        assert!(!server_port_open(&url));
+        assert!(!server_reachable(&url));
+    }
+
+    #[test]
+    fn strip_ansi_drops_color_from_log_lines() {
+        assert_eq!(
+            strip_ansi("\x1b[91m\x1b[1mError: \x1b[0mUnexpected error\n\nServeError\n"),
+            "Error: Unexpected error\n\nServeError\n"
+        );
+        assert_eq!(strip_ansi("plain text"), "plain text");
     }
 }
