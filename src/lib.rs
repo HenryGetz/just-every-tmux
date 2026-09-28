@@ -135,13 +135,24 @@ impl SessionInfo {
         number: u64,
         agent_status: String,
         pane_id: Option<String>,
+        cwd: Option<String>,
         sort_ts: i64,
     ) -> Self {
         let name = format!("herdr:{}", workspace_id);
-        let display_label = if label.is_empty() || label == "~" {
-            format!("ws-{}", number)
-        } else {
+        let display_label = if !label.is_empty() && label != "~" {
             label
+        } else if let Some(dir) = cwd {
+            let p = Path::new(&dir);
+            let home = env::var("HOME").unwrap_or_else(|_| "/home/wavy".to_string());
+            if p == Path::new(&home) || p == Path::new("/") {
+                format!("ws-{}", number)
+            } else if let Some(folder) = p.file_name().and_then(|s| s.to_str()) {
+                folder.to_string()
+            } else {
+                format!("ws-{}", number)
+            }
+        } else {
+            format!("ws-{}", number)
         };
         let name_lc = format!("{} herdr", display_label.to_lowercase());
         Self {
@@ -929,12 +940,16 @@ fn herdr_workspaces_raw() -> Vec<SessionInfo> {
         let agent_status = ws["agent_status"].as_str().unwrap_or("unknown").to_string();
 
         let mut pane_id = None;
+        let mut pane_cwd = None;
         if let Some(panes_list) = panes {
             for p in panes_list {
                 if p["workspace_id"].as_str() == Some(&ws_id) {
-                    pane_id = p["pane_id"].as_str().map(|s| s.to_string());
-                    if p["focused"].as_bool().unwrap_or(false) {
-                        break;
+                    if pane_id.is_none() || p["focused"].as_bool().unwrap_or(false) {
+                        pane_id = p["pane_id"].as_str().map(|s| s.to_string());
+                        let cwd = p["foreground_cwd"].as_str().or_else(|| p["cwd"].as_str());
+                        if let Some(c) = cwd {
+                            pane_cwd = Some(c.to_string());
+                        }
                     }
                 }
             }
@@ -953,6 +968,7 @@ fn herdr_workspaces_raw() -> Vec<SessionInfo> {
             number,
             agent_status,
             pane_id,
+            pane_cwd,
             sort_ts,
         ));
     }
