@@ -3768,10 +3768,9 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let list_area = content_chunks[0];
     let avail_w = list_area.width.saturating_sub(4) as usize;
     let hotkey_col_w = 4usize;
-    let tag_dot_w = 4usize;
-    let ago_col_w = 4usize;
+    let right_meta_w = 8usize; // tag (1) + space (1) + dot (1) + space (1) + ago (4)
     let name_col_w = avail_w
-        .saturating_sub(hotkey_col_w + tag_dot_w + 1 + ago_col_w)
+        .saturating_sub(hotkey_col_w + 1 + right_meta_w)
         .max(8);
 
     let items: Vec<ListItem<'_>> = if app.items.is_empty() {
@@ -3801,17 +3800,17 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
                         format!("{:<hotkey_w$}", hotkey_label_for_index(idx), hotkey_w = hotkey_col_w),
                         Style::default().fg(COLOR_ACCENT),
                     ),
-                    Span::styled(tag, tag_style),
-                    Span::raw(" "),
-                    Span::styled(dot, dot_style),
-                    Span::raw(" "),
                     Span::styled(
                         format!("{:<name_w$}", name, name_w = name_col_w),
                         Style::default().fg(COLOR_TEXT),
                     ),
                     Span::raw(" "),
+                    Span::styled(tag, tag_style),
+                    Span::raw(" "),
+                    Span::styled(dot, dot_style),
+                    Span::raw(" "),
                     Span::styled(
-                        format!("{:>ago_w$}", ago, ago_w = ago_col_w),
+                        format!("{:>4}", ago),
                         Style::default().fg(age_color(s.sort_ts())),
                     ),
                 ]);
