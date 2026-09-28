@@ -3768,10 +3768,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let list_area = content_chunks[0];
     let content_width = list_area.width.saturating_sub(4) as usize;
     let hotkey_col_w = 4usize;
-    let icon_w = 3usize;
+    let tag_status_w = 4usize;
     let ago_col_w = 8usize.min(content_width.saturating_sub(15));
     let name_col_w = content_width
-        .saturating_sub(hotkey_col_w + icon_w + 1 + ago_col_w)
+        .saturating_sub(hotkey_col_w + tag_status_w + 1 + ago_col_w)
         .max(8);
 
     let items: Vec<ListItem<'_>> = if app.items.is_empty() {
@@ -3783,14 +3783,17 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .enumerate()
             .map(|(idx, s)| {
-                let (icon, icon_style) = match &s.backend {
-                    SessionBackend::Tmux => ("\u{ebd8} ", Style::default().fg(COLOR_ACCENT_2)),
-                    SessionBackend::Herdr { agent_status, .. } => match agent_status.as_str() {
-                        "working" => ("🟢", Style::default().fg(Color::Green)),
-                        "blocked" => ("🟡", Style::default().fg(COLOR_WARN)),
-                        "idle" => ("⚪", Style::default().fg(COLOR_MUTED)),
-                        _ => ("⚪", Style::default().fg(COLOR_MUTED)),
-                    },
+                let (tag, tag_style, status_dot) = match &s.backend {
+                    SessionBackend::Tmux => ("t", Style::default().fg(COLOR_ACCENT_2), "  "),
+                    SessionBackend::Herdr { agent_status, .. } => {
+                        let dot = match agent_status.as_str() {
+                            "working" => "🟢",
+                            "blocked" => "🟡",
+                            "idle" => "⚪",
+                            _ => "⚪",
+                        };
+                        ("h", Style::default().fg(COLOR_WARN), dot)
+                    }
                 };
                 let name = ellipsize(&s.display_label, name_col_w);
                 let ago = format_ago(s.sort_ts());
@@ -3799,7 +3802,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
                         format!("{:<hotkey_w$}", hotkey_label_for_index(idx), hotkey_w = hotkey_col_w),
                         Style::default().fg(COLOR_ACCENT),
                     ),
-                    Span::styled(format!("{} ", icon), icon_style),
+                    Span::styled(tag, tag_style),
+                    Span::raw(" "),
+                    Span::raw(status_dot),
+                    Span::raw(" "),
                     Span::styled(
                         format!("{:<name_w$}", name, name_w = name_col_w),
                         Style::default().fg(COLOR_TEXT),
