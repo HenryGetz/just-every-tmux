@@ -3449,7 +3449,7 @@ fn handle_rename_session_mode(app: &mut App, key: KeyEvent) -> Option<Option<Str
 fn desired_sessions_panel_width(items: &[SessionInfo]) -> u16 {
     let max_name_len = items
         .iter()
-        .map(|s| s.name.chars().count())
+        .map(|s| s.display_label.chars().count())
         .max()
         .unwrap_or(12)
         .clamp(12, 44);
@@ -3753,10 +3753,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         let desired_sessions_w = desired_sessions_panel_width(&app.items);
 
         let mut sessions_w = desired_sessions_w
-            .max(20)
+            .max(38)
             .min(total_w.saturating_sub(1).max(1));
 
-        if total_w > min_preview_w + 20 {
+        if total_w > min_preview_w + 38 {
             sessions_w = sessions_w.min(total_w - min_preview_w);
         }
 
@@ -3766,12 +3766,12 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     };
 
     let list_area = content_chunks[0];
-    let content_width = list_area.width.saturating_sub(4) as usize;
+    let avail_w = list_area.width.saturating_sub(4) as usize;
     let hotkey_col_w = 4usize;
-    let tag_status_w = 4usize;
-    let ago_col_w = 8usize.min(content_width.saturating_sub(15));
-    let name_col_w = content_width
-        .saturating_sub(hotkey_col_w + tag_status_w + 1 + ago_col_w)
+    let tag_dot_w = 4usize;
+    let ago_col_w = 4usize;
+    let name_col_w = avail_w
+        .saturating_sub(hotkey_col_w + tag_dot_w + 1 + ago_col_w)
         .max(8);
 
     let items: Vec<ListItem<'_>> = if app.items.is_empty() {
@@ -3783,16 +3783,15 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .enumerate()
             .map(|(idx, s)| {
-                let (tag, tag_style, status_dot) = match &s.backend {
-                    SessionBackend::Tmux => ("t", Style::default().fg(COLOR_ACCENT_2), "  "),
+                let (tag, tag_style, dot, dot_style) = match &s.backend {
+                    SessionBackend::Tmux => ("t", Style::default().fg(COLOR_ACCENT_2), " ", Style::default()),
                     SessionBackend::Herdr { agent_status, .. } => {
-                        let dot = match agent_status.as_str() {
-                            "working" => "🟢",
-                            "blocked" => "🟡",
-                            "idle" => "⚪",
-                            _ => "⚪",
+                        let (dot_char, color) = match agent_status.as_str() {
+                            "working" => ("●", Color::Green),
+                            "blocked" => ("●", COLOR_WARN),
+                            _ => ("●", COLOR_MUTED),
                         };
-                        ("h", Style::default().fg(COLOR_WARN), dot)
+                        ("h", Style::default().fg(COLOR_WARN), dot_char, Style::default().fg(color))
                     }
                 };
                 let name = ellipsize(&s.display_label, name_col_w);
@@ -3804,7 +3803,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
                     ),
                     Span::styled(tag, tag_style),
                     Span::raw(" "),
-                    Span::raw(status_dot),
+                    Span::styled(dot, dot_style),
                     Span::raw(" "),
                     Span::styled(
                         format!("{:<name_w$}", name, name_w = name_col_w),
