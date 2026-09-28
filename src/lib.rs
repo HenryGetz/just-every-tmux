@@ -93,24 +93,70 @@ enum Mode {
     Cwd,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionBackend {
+    Tmux,
+    Herdr {
+        workspace_id: String,
+        pane_id: Option<String>,
+        agent_status: String,
+        number: u64,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct SessionInfo {
     name: String,
+    display_label: String,
     name_lc: String,
     last_attached: i64,
     activity: i64,
     created: i64,
+    backend: SessionBackend,
 }
 
 impl SessionInfo {
     fn new(name: String, last_attached: i64, activity: i64, created: i64) -> Self {
-        let name_lc = name.to_lowercase();
+        let name_lc = format!("{} tmux", name.to_lowercase());
         Self {
+            display_label: name.clone(),
             name,
             name_lc,
             last_attached,
             activity,
             created,
+            backend: SessionBackend::Tmux,
+        }
+    }
+
+    fn new_herdr(
+        workspace_id: String,
+        label: String,
+        number: u64,
+        agent_status: String,
+        pane_id: Option<String>,
+        sort_ts: i64,
+    ) -> Self {
+        let name = format!("herdr:{}", workspace_id);
+        let display_label = if label.is_empty() || label == "~" {
+            format!("workspace-{}", number)
+        } else {
+            label
+        };
+        let name_lc = format!("{} herdr", display_label.to_lowercase());
+        Self {
+            name,
+            display_label,
+            name_lc,
+            last_attached: sort_ts,
+            activity: sort_ts,
+            created: sort_ts,
+            backend: SessionBackend::Herdr {
+                workspace_id,
+                pane_id,
+                agent_status,
+                number,
+            },
         }
     }
 
@@ -377,7 +423,7 @@ const COPY_PREVIEW_HINT: &str = "Esc/Enter close  •  ↑/↓ or j/k scroll  �
 
 impl App {
     fn new() -> Self {
-        let all_sessions = tmux_sessions_raw().unwrap_or_default();
+        let all_sessions = all_sessions_raw().unwrap_or_default();
         let items = filter_and_sort(&all_sessions, "");
         Self {
             all_sessions,
@@ -417,7 +463,7 @@ impl App {
     }
 
     fn refresh_sessions(&mut self) {
-        self.all_sessions = tmux_sessions_raw().unwrap_or_default();
+        self.all_sessions = all_sessions_raw().unwrap_or_default();
         self.selected = 0;
         self.refresh_items();
         self.preview_for = None;
@@ -464,16 +510,28 @@ impl App {
             .preview_pane_ids
             .get(self.preview_selected_idx)
             .map(|s| s.as_str());
-
-        let preview = session_preview_data(&selected, selected_pane).unwrap_or_else(|err| SessionPreview {
-            lines: vec![
-                format!("Preview unavailable: {}", err.msg.trim_end()),
-                "(tmux info could not be fetched)".to_string(),
-            ],
-            pane_ids: Vec::new(),
-            selected_idx: 0,
-        });
-
+        let selected_session = self.items.get(self.selected);
+        let preview = match selected_session {
+            Some(s) if matches!(s.backend, SessionBackend::Herdr { .. }) => {
+                if let SessionBackend::Herdr { pane_id, .. } = &s.backend {
+                    herdr_pane_preview_data(pane_id.as_deref())
+                } else {
+                    SessionPreview {
+                        lines: vec!["(no pane)".to_string()],
+                        pane_ids: Vec::new(),
+                        selected_idx: 0,
+                    }
+                }
+            }
+            _ => session_preview_data(&selected, selected_pane).unwrap_or_else(|err| SessionPreview {
+                lines: vec![
+                    format!("Preview unavailable: {}", err.msg.trim_end()),
+                    "(tmux info could not be fetched)".to_string(),
+                ],
+                pane_ids: Vec::new(),
+                selected_idx: 0,
+            }),
+        };
         self.preview_lines = preview.lines;
         self.preview_pane_ids = preview.pane_ids;
         self.preview_selected_idx = preview
@@ -629,6 +687,16 @@ fn run_inner() -> BrResult<i32> {
             println!("opencode server: {} at {}", status, url);
             return Ok(0);
         }
+        // Check if argument matches an existing Herdr workspace label
+        let herdr_sessions = herdr_workspaces_raw();
+        if let Some(h) = herdr_sessions
+            .iter()
+            .find(|s| s.display_label.eq_ignore_ascii_case(arg))
+        {
+            if let Some(ws_id) = h.name.strip_prefix("herdr:") {
+                return Ok(exec_herdr_workspace(ws_id));
+            }
+        }
 
         let name = normalize_or_exit(arg)?;
         create_session_if_needed(&name, mode)?;
@@ -638,9 +706,27 @@ fn run_inner() -> BrResult<i32> {
     match tui(mode)? {
         None => Ok(0),
         Some(name) => {
-            create_session_if_needed(&name, mode)?;
-            Ok(exec_attach_or_switch(&name))
+            if let Some(ws_id) = name.strip_prefix("herdr:") {
+                Ok(exec_herdr_workspace(ws_id))
+            } else {
+                create_session_if_needed(&name, mode)?;
+                Ok(exec_attach_or_switch(&name))
+            }
         }
+    }
+}
+
+fn exec_herdr_workspace(workspace_id: &str) -> i32 {
+    let _ = Command::new("herdr")
+        .args(["workspace", "focus", workspace_id])
+        .status();
+
+    if env::var_os("HERDR_ENV").is_none() {
+        use std::os::unix::process::CommandExt;
+        let _ = Command::new("herdr").exec();
+        1
+    } else {
+        0
     }
 }
 
@@ -814,17 +900,82 @@ fn tmux_sessions_raw() -> BrResult<Vec<SessionInfo>> {
 
     Ok(sessions)
 }
+fn herdr_workspaces_raw() -> Vec<SessionInfo> {
+    let out = match Command::new("herdr").args(["api", "snapshot"]).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+
+    let Ok(val): Result<Value, _> = serde_json::from_slice(&out) else {
+        return Vec::new();
+    };
+
+    let snapshot = &val["result"]["snapshot"];
+    let Some(workspaces) = snapshot["workspaces"].as_array() else {
+        return Vec::new();
+    };
+
+    let panes = snapshot["panes"].as_array();
+    let now = now_epoch_secs() as i64;
+
+    let mut sessions = Vec::new();
+    for ws in workspaces {
+        let ws_id = ws["workspace_id"].as_str().unwrap_or("").to_string();
+        if ws_id.is_empty() {
+            continue;
+        }
+        let raw_label = ws["label"].as_str().unwrap_or("").trim().to_string();
+        let number = ws["number"].as_u64().unwrap_or(0);
+        let agent_status = ws["agent_status"].as_str().unwrap_or("unknown").to_string();
+
+        let mut pane_id = None;
+        if let Some(panes_list) = panes {
+            for p in panes_list {
+                if p["workspace_id"].as_str() == Some(&ws_id) {
+                    pane_id = p["pane_id"].as_str().map(|s| s.to_string());
+                    if p["focused"].as_bool().unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let sort_ts = match agent_status.as_str() {
+            "working" => now,
+            "blocked" => now - 1,
+            "idle" => now - 60 * (number as i64),
+            _ => now - 3600 * (number as i64),
+        };
+
+        sessions.push(SessionInfo::new_herdr(
+            ws_id,
+            raw_label,
+            number,
+            agent_status,
+            pane_id,
+            sort_ts,
+        ));
+    }
+
+    sessions
+}
+
+fn all_sessions_raw() -> BrResult<Vec<SessionInfo>> {
+    let mut sessions = tmux_sessions_raw()?;
+    let herdr_sessions = herdr_workspaces_raw();
+    sessions.extend(herdr_sessions);
+    Ok(sessions)
+}
 
 fn list_sessions() -> BrResult<Vec<String>> {
-    let mut sessions = tmux_sessions_raw()?;
+    let mut sessions = all_sessions_raw()?;
     sessions.sort_by(|a, b| {
         b.sort_ts()
             .cmp(&a.sort_ts())
             .then_with(|| a.name_lc.cmp(&b.name_lc))
     });
-    Ok(sessions.into_iter().map(|s| s.name).collect())
+    Ok(sessions.into_iter().map(|s| s.display_label).collect())
 }
-
 fn session_exists(name: &str) -> BrResult<bool> {
     let tmux = tmux_path()?;
     let args = vec!["has-session".to_string(), "-t".to_string(), name.to_string()];
@@ -1411,6 +1562,43 @@ fn kill_pane(session: &str, pane_id: &str) -> BrResult<bool> {
         format!("{}:{}", session, pane_id),
     ])?;
     Ok(out.code == 0)
+}
+
+fn herdr_pane_preview_data(pane_id: Option<&str>) -> SessionPreview {
+    let Some(id) = pane_id else {
+        return SessionPreview {
+            lines: vec!["(no pane available in workspace)".to_string()],
+            pane_ids: Vec::new(),
+            selected_idx: 0,
+        };
+    };
+
+    let out = match Command::new("herdr")
+        .args(["pane", "read", id, "--lines", "40"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => {
+            return SessionPreview {
+                lines: vec!["(pane preview unavailable)".to_string()],
+                pane_ids: vec![id.to_string()],
+                selected_idx: 0,
+            }
+        }
+    };
+
+    let lines: Vec<String> = out.lines().map(|s| s.to_string()).collect();
+    let lines = if lines.is_empty() {
+        vec!["(empty pane)".to_string()]
+    } else {
+        lines
+    };
+
+    SessionPreview {
+        lines,
+        pane_ids: vec![id.to_string()],
+        selected_idx: 0,
+    }
 }
 
 fn session_preview_data(name: &str, selected_pane: Option<&str>) -> BrResult<SessionPreview> {
@@ -2390,18 +2578,34 @@ fn prompt_delete_selected_session(app: &mut App) {
 }
 
 fn start_rename_prompt(app: &mut App) {
-    let Some(name) = app.selected_name().map(|s| s.to_string()) else {
+    let Some(item) = app.items.get(app.selected) else {
         app.set_status_for("No session selected", Duration::from_millis(1000));
         return;
     };
 
     app.input_mode = InputMode::RenameSession;
-    app.rename_target = Some(name.clone());
-    app.rename_session_name = name;
+    app.rename_target = Some(item.name.clone());
+    app.rename_session_name = item.display_label.clone();
 }
 
 fn kill_session_by_name(app: &mut App, name: String) {
     app.pending_delete = None;
+    if let Some(ws_id) = name.strip_prefix("herdr:") {
+        let status = Command::new("herdr")
+            .args(["workspace", "close", ws_id])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                app.refresh_sessions();
+                app.set_status_for("Closed Herdr workspace.", Duration::from_millis(1200));
+            }
+            _ => {
+                app.set_status_for("Failed to close Herdr workspace.", Duration::from_millis(1400));
+            }
+        }
+        return;
+    }
+
     match kill_session(&name) {
         Ok(true) => {
             app.refresh_sessions();
@@ -2436,6 +2640,12 @@ fn rename_session_args(old_name: &str, new_name: &str) -> Vec<String> {
 }
 
 fn rename_session(old_name: &str, new_name: &str) -> BrResult<bool> {
+    if let Some(ws_id) = old_name.strip_prefix("herdr:") {
+        let status = Command::new("herdr")
+            .args(["workspace", "rename", ws_id, new_name])
+            .status();
+        return Ok(status.map(|s| s.success()).unwrap_or(false));
+    }
     let out = tmux_capture(rename_session_args(old_name, new_name))?;
     Ok(out.code == 0)
 }
@@ -3558,9 +3768,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let list_area = content_chunks[0];
     let content_width = list_area.width.saturating_sub(4) as usize;
     let hotkey_col_w = 4usize;
+    let badge_icon_w = 11usize;
     let ago_col_w = 10usize.min(content_width.saturating_sub(8));
     let name_col_w = content_width
-        .saturating_sub(hotkey_col_w + 2 + ago_col_w)
+        .saturating_sub(hotkey_col_w + badge_icon_w + 2 + ago_col_w)
         .max(8);
 
     let items: Vec<ListItem<'_>> = if app.items.is_empty() {
@@ -3572,13 +3783,27 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .enumerate()
             .map(|(idx, s)| {
-                let name = ellipsize(&s.name, name_col_w);
+                let (badge, badge_style, icon) = match &s.backend {
+                    SessionBackend::Tmux => ("[tmux] ", Style::default().fg(COLOR_ACCENT_2), "⚡ "),
+                    SessionBackend::Herdr { agent_status, .. } => {
+                        let icon = match agent_status.as_str() {
+                            "working" => "🟢 ",
+                            "blocked" => "🟡 ",
+                            "idle" => "⚪ ",
+                            _ => "⚪ ",
+                        };
+                        ("[herdr]", Style::default().fg(COLOR_WARN), icon)
+                    }
+                };
+                let name = ellipsize(&s.display_label, name_col_w);
                 let ago = format_ago(s.sort_ts());
                 let header = Line::from(vec![
                     Span::styled(
                         format!("{:<hotkey_w$}", hotkey_label_for_index(idx), hotkey_w = hotkey_col_w),
                         Style::default().fg(COLOR_ACCENT),
                     ),
+                    Span::styled(format!("{} ", badge), badge_style),
+                    Span::raw(icon),
                     Span::styled(
                         format!("{:<name_w$}", name, name_w = name_col_w),
                         Style::default().fg(COLOR_TEXT),
