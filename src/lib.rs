@@ -911,7 +911,24 @@ fn tmux_sessions_raw() -> BrResult<Vec<SessionInfo>> {
 
     Ok(sessions)
 }
+fn herdr_session_mtime() -> Option<i64> {
+    let home = env::var("HOME").ok()?;
+    let path = Path::new(&home).join(".config/herdr/session.json");
+    let meta = std::fs::metadata(path).ok()?;
+    let mod_time = meta.modified().ok()?;
+    let dur = mod_time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(dur.as_secs() as i64)
+}
+
+fn herdr_enabled() -> bool {
+    env::var_os("BR_NO_HERDR").is_none() && env::var_os("B_NO_HERDR").is_none()
+}
+
 fn herdr_workspaces_raw() -> Vec<SessionInfo> {
+    if !herdr_enabled() {
+        return Vec::new();
+    }
+
     let out = match Command::new("herdr").args(["api", "snapshot"]).output() {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
@@ -928,6 +945,7 @@ fn herdr_workspaces_raw() -> Vec<SessionInfo> {
 
     let panes = snapshot["panes"].as_array();
     let now = now_epoch_secs() as i64;
+    let mtime = herdr_session_mtime();
 
     let mut sessions = Vec::new();
     for ws in workspaces {
@@ -938,12 +956,18 @@ fn herdr_workspaces_raw() -> Vec<SessionInfo> {
         let raw_label = ws["label"].as_str().unwrap_or("").trim().to_string();
         let number = ws["number"].as_u64().unwrap_or(0);
         let agent_status = ws["agent_status"].as_str().unwrap_or("unknown").to_string();
+        let has_custom_label = !raw_label.is_empty() && raw_label != "~";
 
         let mut pane_id = None;
         let mut pane_cwd = None;
+        let mut max_revision = 0u64;
         if let Some(panes_list) = panes {
             for p in panes_list {
                 if p["workspace_id"].as_str() == Some(&ws_id) {
+                    let rev = p["revision"].as_u64().unwrap_or(0);
+                    if rev > max_revision {
+                        max_revision = rev;
+                    }
                     if pane_id.is_none() || p["focused"].as_bool().unwrap_or(false) {
                         pane_id = p["pane_id"].as_str().map(|s| s.to_string());
                         let cwd = p["foreground_cwd"].as_str().or_else(|| p["cwd"].as_str());
@@ -955,11 +979,18 @@ fn herdr_workspaces_raw() -> Vec<SessionInfo> {
             }
         }
 
-        let sort_ts = match agent_status.as_str() {
-            "working" => now,
-            "blocked" => now - 1,
-            "idle" => now - 60 * (number as i64),
-            _ => now - 3600 * (number as i64),
+        let sort_ts = if agent_status == "working" {
+            now
+        } else if agent_status == "blocked" {
+            now - 1
+        } else if !has_custom_label && max_revision == 0 && agent_status == "unknown" {
+            // Pristine, untouched workspace that the user has never used:
+            // do not fake recent timestamps. Keep at 0 so it stays at the bottom.
+            0
+        } else {
+            // Real static timestamp from when Herdr session state was last modified,
+            // or 0 if unavailable. Never fabricate dynamic `now - 3600` offsets.
+            mtime.unwrap_or(0)
         };
 
         sessions.push(SessionInfo::new_herdr(
